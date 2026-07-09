@@ -88,6 +88,34 @@ const findElementWithText = (node: ReactNodeLike, needle: string): React.ReactEl
   return textContent(node).includes(needle) ? node : null
 }
 
+const findComponentByName = (node: ReactNodeLike, name: string): React.ReactElement | null => {
+  if (node === null || node === undefined || typeof node === 'boolean') {
+    return null
+  }
+
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const found = findComponentByName(child, name)
+
+      if (found) {
+        return found
+      }
+    }
+
+    return null
+  }
+
+  if (!React.isValidElement(node)) {
+    return null
+  }
+
+  if (typeof node.type === 'function' && node.type.name === name) {
+    return node
+  }
+
+  return findComponentByName(node.props.children, name)
+}
+
 const baseProps = {
   bgCount: 0,
   busy: false,
@@ -301,38 +329,27 @@ describe('StatusRule credits notice render priority', () => {
   })
 })
 
+describe('StatusRule startup visual busy state', () => {
+  it('shows the animated busy indicator while a session is starting even before a turn is busy', () => {
+    const element = StatusRule({
+      ...baseProps,
+      busy: false,
+      status: 'starting agent…',
+      turnStartedAt: null
+    })
+
+    const ticker = findComponentByName(element, 'FaceTicker')
+
+    expect(ticker).not.toBeNull()
+    expect(ticker!.props.startedAt).toBeNull()
+    expect(textContent(element)).not.toContain('starting agent…')
+  })
+})
+
 describe('StatusRule idle-since read-out', () => {
   // The IdleSince component uses hooks, so it can't be invoked outside a
   // renderer — assert on the element tree instead (same reason the duration
   // tests don't check SessionDuration's text).
-  const findComponentByName = (node: ReactNodeLike, name: string): React.ReactElement | null => {
-    if (node === null || node === undefined || typeof node === 'boolean') {
-      return null
-    }
-
-    if (Array.isArray(node)) {
-      for (const child of node) {
-        const found = findComponentByName(child, name)
-
-        if (found) {
-          return found
-        }
-      }
-
-      return null
-    }
-
-    if (!React.isValidElement(node)) {
-      return null
-    }
-
-    if (typeof node.type === 'function' && node.type.name === name) {
-      return node
-    }
-
-    return findComponentByName(node.props.children, name)
-  }
-
   it('shows time since the last final agent response when idle', () => {
     const endedAt = Date.now() - 42_000
     const element = StatusRule({

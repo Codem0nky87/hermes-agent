@@ -1295,8 +1295,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
 async def _standalone_send(
     pconfig,
-    chat_id,
-    message,
+    chat_id: str,
+    message: str,
     *,
     thread_id=None,
     media_files=None,
@@ -1306,32 +1306,83 @@ async def _standalone_send(
 
     Implements the standalone_sender_fn contract so deliver=whatsapp cron jobs
     succeed when cron runs separately from the gateway. Replaces the legacy
-    _send_whatsapp helper.
+    _send_whatsapp helper. Supports MEDIA attachments by routing them to the
+    bridge's native /send-media endpoint.
     """
     extra = getattr(pconfig, "extra", {}) or {}
     try:
         import aiohttp
     except ImportError:
         return {"error": "aiohttp not installed. Run: pip install aiohttp"}
+
+    def _infer_media_type(path: str, is_voice: bool = False) -> str:
+        if force_document:
+            return "document"
+        if is_voice:
+            return "audio"
+        ext = os.path.splitext(path)[1].lower()
+        if ext in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+            return "image"
+        if ext in {".mp4", ".mov", ".avi", ".mkv", ".3gp"}:
+            return "video"
+        if ext in {".ogg", ".opus", ".mp3", ".wav", ".m4a", ".flac"}:
+            return "audio"
+        return "document"
+
     try:
         bridge_port = extra.get("bridge_port", 3000)
         normalized_chat_id = to_whatsapp_jid(chat_id)
         async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"http://localhost:{bridge_port}/send",
-                json={"chatId": normalized_chat_id, "message": message},
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return {
-                        "success": True,
-                        "platform": "whatsapp",
-                        "chat_id": normalized_chat_id,
-                        "message_id": data.get("messageId"),
-                    }
-                body = await resp.text()
-                return {"error": f"WhatsApp bridge error ({resp.status}): {body}"}
+            last_message_id = None
+            pending_media = list(media_files or [])
+
+            if message.strip() and (
+                not pending_media
+                or _infer_media_type(pending_media[0][0], pending_media[0][1]) == "audio"
+            ):
+                async with session.post(
+                    f"http://localhost:{bridge_port}/send",
+                    json={"chatId": normalized_chat_id, "message": message},
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        last_message_id = data.get("messageId")
+                    else:
+                        body = await resp.text()
+                        return {"error": f"WhatsApp bridge error ({resp.status}): {body}"}
+
+            for index, media_item in enumerate(pending_media):
+                file_path, is_voice = media_item
+                media_type = _infer_media_type(file_path, is_voice)
+                payload = {
+                    "chatId": normalized_chat_id,
+                    "filePath": file_path,
+                    "mediaType": media_type,
+                }
+                if index == 0 and message.strip() and media_type != "audio":
+                    payload["caption"] = message.strip()
+                if media_type == "document":
+                    payload["fileName"] = os.path.basename(file_path)
+
+                async with session.post(
+                    f"http://localhost:{bridge_port}/send-media",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=120),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        last_message_id = data.get("messageId")
+                    else:
+                        body = await resp.text()
+                        return {"error": f"WhatsApp bridge media error ({resp.status}): {body}"}
+
+            return {
+                "success": True,
+                "platform": "whatsapp",
+                "chat_id": normalized_chat_id,
+                "message_id": last_message_id,
+            }
     except Exception as e:
         return {"error": f"WhatsApp send failed: {e}"}
 

@@ -5380,6 +5380,24 @@ class TestPtyWebSocket:
         assert env["HERMES_TUI_INLINE"] == "1"
         assert env["HERMES_TUI_DISABLE_MOUSE"] == "1"
 
+    def test_resolve_chat_argv_honors_dashboard_inline_toggle(self, monkeypatch):
+        """Dashboard chat can opt into the normal alternate-screen TUI."""
+        import hermes_cli.main as main_mod
+
+        monkeypatch.setenv("HERMES_DASHBOARD_TUI_INLINE", "0")
+        monkeypatch.delenv("HERMES_TUI_INLINE", raising=False)
+        monkeypatch.setattr(
+            main_mod,
+            "_make_tui_argv",
+            lambda project_root, tui_dev=False: (["node", "dist/entry.js"], "/tmp/ui-tui"),
+        )
+
+        _argv, _cwd, env = self.ws_module._resolve_chat_argv()
+
+        assert env["HERMES_TUI_DASHBOARD"] == "1"
+        assert env["HERMES_TUI_INLINE"] == "0"
+        assert env["HERMES_TUI_DISABLE_MOUSE"] == "1"
+
     def test_resolve_chat_argv_applies_terminal_backend_config(
         self, monkeypatch, _isolate_hermes_home
     ):
