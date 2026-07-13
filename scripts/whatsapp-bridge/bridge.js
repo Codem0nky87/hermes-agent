@@ -880,6 +880,26 @@ app.post('/edit', async (req, res) => {
   }
 });
 
+// Delete a previously sent message for everyone where WhatsApp permits it
+app.post('/delete', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+
+  const { chatId, messageId } = req.body;
+  if (!chatId || !messageId) {
+    return res.status(400).json({ error: 'chatId and messageId are required' });
+  }
+
+  try {
+    const key = { id: messageId, fromMe: true, remoteJid: chatId };
+    const sent = await sendWithTimeout(chatId, { delete: key });
+    res.json({ success: true, messageId: sent?.key?.id || '' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Send media (image, video, document) natively
 app.post('/send-media', async (req, res) => {
   if (!sock || connectionState !== 'connected') {

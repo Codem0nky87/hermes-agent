@@ -14499,6 +14499,10 @@ def _resolve_chat_argv(
     # build unchanged for native CLI usage; only disable mouse tracking for
     # the dashboard PTY path.
     env.setdefault("HERMES_TUI_DISABLE_MOUSE", "1")
+    # Dashboard-specific default for the child TUI renderer. Leave the lower-level
+    # HERMES_TUI_INLINE override intact when the parent explicitly set it.
+    if "HERMES_TUI_INLINE" not in env and "HERMES_DASHBOARD_TUI_INLINE" in env:
+        env["HERMES_TUI_INLINE"] = env["HERMES_DASHBOARD_TUI_INLINE"]
     env.setdefault("HERMES_TUI_INLINE", "1")
     # The dashboard terminal is xterm.js, which always renders 24-bit RGB.
     # But chalk inside the TUI child decides its color depth from the

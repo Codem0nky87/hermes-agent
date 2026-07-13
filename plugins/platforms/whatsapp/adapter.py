@@ -1563,8 +1563,8 @@ def _bridge_media_type(file_path: str, is_voice: bool, force_document: bool) -> 
 
 async def _standalone_send(
     pconfig,
-    chat_id,
-    message,
+    chat_id: str,
+    message: str,
     *,
     thread_id=None,
     media_files=None,
@@ -1574,7 +1574,8 @@ async def _standalone_send(
 
     Implements the standalone_sender_fn contract so deliver=whatsapp cron jobs
     succeed when cron runs separately from the gateway. Replaces the legacy
-    _send_whatsapp helper.
+    _send_whatsapp helper. Supports media attachments by routing them to the
+    bridge's native /send-media endpoint.
     """
     extra = getattr(pconfig, "extra", {}) or {}
     try:
@@ -1584,12 +1585,14 @@ async def _standalone_send(
     try:
         bridge_port = extra.get("bridge_port", 3000)
         normalized_chat_id = to_whatsapp_jid(chat_id)
-        media = media_files or []
+        media = list(media_files or [])
         text = message or ""
         last_message_id = None
         async with aiohttp.ClientSession() as session:
-            # 1) Text first (skip the /send call when this chunk is media-only).
-            if text.strip():
+            # 1) Text first unless it can be carried as the first non-audio
+            # media caption. Audio/voice messages stay separate so a spoken
+            # note is not silently paired with unrelated text.
+            if text.strip() and (not media or _bridge_media_type(media[0][0], media[0][1], force_document) == "audio"):
                 async with session.post(
                     f"http://localhost:{bridge_port}/send",
                     json={"chatId": normalized_chat_id, "message": text},
@@ -1605,7 +1608,7 @@ async def _standalone_send(
             # bridge maps mediaType -> image/video/audio/document message kinds
             # so PNG/JPEG/WebP/GIF arrive as inline images, MP4 as a video
             # bubble, and ogg/opus as a voice note — not a file/document.
-            for media_path, is_voice in media:
+            for index, (media_path, is_voice) in enumerate(media):
                 if not os.path.exists(media_path):
                     return {"error": f"WhatsApp media file not found: {media_path}"}
                 media_type = _bridge_media_type(media_path, is_voice, force_document)
@@ -1614,6 +1617,8 @@ async def _standalone_send(
                     "filePath": media_path,
                     "mediaType": media_type,
                 }
+                if index == 0 and text.strip() and media_type != "audio":
+                    payload["caption"] = text.strip()
                 if media_type == "document":
                     payload["fileName"] = os.path.basename(media_path)
                 async with session.post(
