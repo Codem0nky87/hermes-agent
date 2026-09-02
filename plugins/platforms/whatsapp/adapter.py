@@ -16,11 +16,13 @@ with different backends via a bridge pattern.
 """
 
 import asyncio
+import json
 import logging
 import os
 import platform
 import re
 import signal
+import stat
 import subprocess
 
 _IS_WINDOWS = platform.system() == "Windows"
@@ -57,88 +59,38 @@ def _wenv(name: str, default: str = "") -> str:
 
 logger = logging.getLogger(__name__)
 
+
+class WhatsAppBridgeOwnershipError(RuntimeError):
+    """A listener or PID record could not be proven to be this bridge."""
+
 # Inbound owner-typed WhatsApp text is prefixed at MessageEvent construction so
 # transcripts stay disambiguated even if downstream plugins fail before silent_ingest.
 _OWNER_REPLY_PREFIX = "[owner reply] "
 
 
-def _listener_pids_on_port(port: int) -> list:
-    """PIDs of processes *listening* on ``port`` (POSIX) — never clients.
-
-    This must match only LISTEN sockets. A bare ``lsof -i :PORT`` (or
-    ``fuser PORT/tcp``) also returns *clients* whose connection merely involves
-    that port number — e.g. a browser with a tab open on a local dev server
-    sharing the port. SIGTERMing those closed the user's browser at irregular
-    intervals. Restricting to LISTEN state frees the port for a new bridge
-    without ever touching an unrelated client.
-    """
-    pids: list = []
-    try:
-        result = subprocess.run(
-            ["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
-            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
-        )
-        for line in result.stdout.strip().splitlines():
-            try:
-                pids.append(int(line))
-            except ValueError:
-                pass
-        if pids:
-            return pids
-    except FileNotFoundError:
-        pass  # lsof not installed — fall through to ss
-    # Fallback: ss (iproute2, present on virtually every modern Linux).
-    try:
-        result = subprocess.run(
-            ["ss", "-ltnHp", f"sport = :{port}"],
-            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
-        )
-        for m in re.finditer(r"pid=(\d+)", result.stdout):
-            pids.append(int(m.group(1)))
-    except FileNotFoundError:
-        pass
-    return pids
+def _http_error_message(message: str, status: Any) -> str:
+    """Return a fixed transport error while retaining a numeric HTTP status."""
+    if isinstance(status, int) and not isinstance(status, bool):
+        return f"{message} (HTTP {status})."
+    return f"{message}."
 
 
-def _kill_port_process(port: int) -> None:
-    """Kill any process *listening* on the given TCP port (a stale bridge)."""
-    try:
-        if _IS_WINDOWS:
-            from hermes_cli._subprocess_compat import windows_hide_flags
+def _listener_pids_on_port(port: int) -> Optional[list[int]]:
+    """Return proven LISTEN owners, or ``None`` when ownership is unreadable."""
+    from gateway.platforms.whatsapp_recovery import _listener_pids_on_port as inspect
 
-            # Use netstat to find the PID bound to this port, then taskkill
-            result = subprocess.run(
-                ["netstat", "-ano", "-p", "TCP"],
-                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
-                creationflags=windows_hide_flags(),
-            )
-            for line in result.stdout.splitlines():
-                parts = line.split()
-                if len(parts) >= 5 and parts[3] == "LISTENING":
-                    local_addr = parts[1]
-                    if local_addr.endswith(f":{port}"):
-                        try:
-                            subprocess.run(
-                                ["taskkill", "/PID", parts[4], "/F"],
-                                capture_output=True, timeout=5,
-                                creationflags=windows_hide_flags(),
-                            )
-                        except subprocess.SubprocessError:
-                            pass
-        else:
-            # POSIX: only ever signal a process LISTENING on the port. A client
-            # whose connection happens to involve this port number (a browser
-            # tab on a local dev server, etc.) must never be killed.
-            for pid in _listener_pids_on_port(port):
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except (ProcessLookupError, PermissionError, OSError):
-                    pass
-    except Exception:
-        pass
+    return inspect(port)
 
 
-def _bridge_pid_is_ours(pid: int, session_path: Path, expected_start) -> bool:
+def _bridge_pid_is_ours(
+    pid: int,
+    session_path: Path,
+    expected_start,
+    port: int,
+    bridge_script: Path,
+    *,
+    listener_pids: Optional[list[int]] = None,
+) -> bool:
     """True only if ``pid`` is alive AND still our node bridge for this session.
 
     The PID is read from a file written by a previous run.  Once that process
@@ -147,29 +99,73 @@ def _bridge_pid_is_ours(pid: int, session_path: Path, expected_start) -> bool:
     which a bare-liveness ``os.kill`` then SIGTERMed, closing the whole browser
     at irregular intervals (every time the flapping bridge restarted).
 
-    Identity is confirmed two ways: the kernel start time captured when we wrote
-    the pidfile (definitive), and — for legacy pidfiles with no baseline — the
-    command line, which must contain ``node`` and this session's unique path.
-    A recycled PID (different start time / different cmdline) is never ours.
+    A recorded start time is a necessary PID-reuse guard when present, but is
+    never authority by itself. The live process must also be the exact Node
+    executable + bridge.js invocation, carry this resolved ``--session`` and
+    ``--port``, and own the port's LISTEN socket.
     """
     from gateway.status import _pid_exists
     if not _pid_exists(pid):
         return False
     if expected_start is not None:
         from gateway.status import get_process_start_time
-        # A matching (pid, start time) pair uniquely identifies the process.
-        return get_process_start_time(pid) == expected_start
-    # Legacy pidfile (no recorded start time): fall back to a command-line
-    # signature so a recycled PID is still never signalled.  If we cannot read
-    # the cmdline we refuse to kill rather than risk a stranger.
-    from gateway.status import _read_process_cmdline
-    cmdline = _read_process_cmdline(pid)
-    if not cmdline:
-        return False
-    return ("node" in cmdline) and (str(session_path) in cmdline)
+
+        current_start = get_process_start_time(pid)
+        if current_start is None or current_start != expected_start:
+            return False
+    from gateway.platforms.whatsapp_recovery import bridge_process_is_exact_listener
+
+    return bridge_process_is_exact_listener(
+        pid,
+        session_path,
+        port,
+        bridge_script,
+        listener_pids=listener_pids,
+    )
 
 
-def _kill_stale_bridge_by_pidfile(session_path: Path) -> None:
+def _kill_port_process(port: int, session_path: Path, bridge_script: Path) -> None:
+    """Stop only exact matching bridge listeners; refuse every unknown owner."""
+    from gateway.status import _pid_exists
+
+    listeners = _listener_pids_on_port(port)
+    if listeners is None:
+        raise WhatsAppBridgeOwnershipError(
+            "The WhatsApp bridge listener could not be verified."
+        )
+    live_listeners = [pid for pid in listeners if _pid_exists(pid)]
+    if not live_listeners:
+        return
+    if any(
+        not _bridge_pid_is_ours(
+            pid,
+            session_path,
+            None,
+            port,
+            bridge_script,
+            listener_pids=live_listeners,
+        )
+        for pid in live_listeners
+    ):
+        raise WhatsAppBridgeOwnershipError(
+            "The WhatsApp bridge port is owned by another process."
+        )
+    from gateway.status import terminate_pid
+
+    for pid in live_listeners:
+        try:
+            terminate_pid(pid, force=False)
+        except ProcessLookupError:
+            continue
+        except OSError as exc:
+            raise WhatsAppBridgeOwnershipError(
+                "The verified WhatsApp bridge could not be stopped."
+            ) from exc
+
+
+def _kill_stale_bridge_by_pidfile(
+    session_path: Path, port: int, bridge_script: Path
+) -> None:
     """Kill a bridge process recorded in a PID file from a previous run.
 
     The bridge writes ``bridge.pid`` into the session directory when it
@@ -180,38 +176,52 @@ def _kill_stale_bridge_by_pidfile(session_path: Path) -> None:
     (:func:`_bridge_pid_is_ours`) before any signal, so a recycled PID that now
     names an unrelated process (e.g. the user's browser) is never killed.
     """
+    from gateway.status import _pid_exists
+    from gateway.platforms.whatsapp_recovery import (
+        WhatsAppRecoveryError,
+        _read_recorded_bridge,
+    )
+
     pid_file = session_path / "bridge.pid"
-    if not pid_file.exists():
-        return
-    pid = None
-    recorded_start = None
     try:
-        # Format: line 1 = pid, optional line 2 = kernel start time. Legacy
-        # files written before the guard existed have only the pid.
-        lines = pid_file.read_text(encoding="utf-8").split("\n")
-        pid = int(lines[0].strip())
-        if len(lines) > 1 and lines[1].strip():
-            recorded_start = int(lines[1].strip())
-    except (ValueError, OSError, TypeError, IndexError):
+        recorded = _read_recorded_bridge(session_path)
+    except WhatsAppRecoveryError as exc:
+        raise WhatsAppBridgeOwnershipError(
+            "The WhatsApp bridge PID record could not be verified."
+        ) from exc
+    if recorded is None:
+        return
+    pid, recorded_start = recorded
+    if not _pid_exists(pid):
         try:
             pid_file.unlink()
         except OSError:
             pass
         return
-    if _bridge_pid_is_ours(pid, session_path, recorded_start):
-        try:
-            os.kill(pid, signal.SIGTERM)
-            logger.info("[whatsapp] Killed stale bridge PID %d from pidfile", pid)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-    else:
-        from gateway.status import _pid_exists
-        if _pid_exists(pid):
-            logger.warning(
-                "[whatsapp] Not killing pidfile PID %d: it is no longer the "
-                "bridge (recycled onto an unrelated process); skipping to avoid "
-                "killing a stranger.", pid,
-            )
+
+    listeners = _listener_pids_on_port(port)
+    if listeners is None or not _bridge_pid_is_ours(
+        pid,
+        session_path,
+        recorded_start,
+        port,
+        bridge_script,
+        listener_pids=listeners,
+    ):
+        raise WhatsAppBridgeOwnershipError(
+            "The recorded WhatsApp bridge identity could not be verified."
+        )
+    from gateway.status import terminate_pid
+
+    try:
+        terminate_pid(pid, force=False)
+        logger.info("[whatsapp] Stopped a verified stale bridge process.")
+    except ProcessLookupError:
+        pass
+    except OSError as exc:
+        raise WhatsAppBridgeOwnershipError(
+            "The verified WhatsApp bridge could not be stopped."
+        ) from exc
     try:
         pid_file.unlink()
     except OSError:
@@ -284,7 +294,22 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.whatsapp_common import WhatsAppBehaviorMixin
+from gateway.platforms.whatsapp_common import (
+    WhatsAppBehaviorMixin,
+    WhatsAppSessionStateError,
+    ensure_whatsapp_session_dir,
+    is_whatsapp_session_revoked,
+    whatsapp_bridge_dependencies_fresh,
+    whatsapp_bridge_runtime_hash,
+    write_whatsapp_bridge_dependency_stamp,
+)
+from gateway.platforms.whatsapp_recovery import (
+    acquire_whatsapp_connect_gate,
+    note_whatsapp_session_lock_acquired,
+    note_whatsapp_session_lock_released,
+    validate_whatsapp_session_lock_state,
+    whatsapp_recovery_is_active,
+)
 from gateway.whatsapp_identity import to_whatsapp_jid
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -339,20 +364,19 @@ def _is_allowed_bridge_path(url: str) -> bool:
     return False
 
 
-def _file_content_hash(path: Path) -> str:
-    """Return the first 16 hex chars of the SHA-256 of *path*'s contents.
+_BRIDGE_RUNTIME_HASH_RE = re.compile(r"^[a-f0-9]{64}$")
 
-    Used for the bridge staleness handshake: bridge.js reports its own
-    source hash in ``/health`` (``scriptHash``), and the adapter compares
-    it against the hash of bridge.js currently on disk.  A mismatch means
-    a long-lived bridge process is serving code from before an update.
-    Returns ``""`` when the file can't be read.
-    """
-    import hashlib
-    try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
-    except OSError:
+
+def _reported_bridge_runtime_hash(health: Any) -> str:
+    """Read one valid composite hash, preferring the explicit health field."""
+    if not isinstance(health, dict):
         return ""
+    value = health.get("runtimeHash")
+    if value is None:
+        value = health.get("scriptHash")
+    if not isinstance(value, str) or not _BRIDGE_RUNTIME_HASH_RE.fullmatch(value):
+        return ""
+    return value
 
 
 def check_whatsapp_requirements() -> bool:
@@ -376,6 +400,393 @@ def check_whatsapp_requirements() -> bool:
         return result.returncode == 0
     except Exception:
         return False
+
+
+#: Re-pair instructions appended to every "this session cannot connect" fatal.
+_REPAIR_HINT = (
+    "Re-pair with `hermes whatsapp` (or from the dashboard), or remove "
+    "WHATSAPP_ENABLED from your .env to disable WhatsApp."
+)
+
+#: Exit code the Node bridge uses for "WhatsApp logged this device out".
+#:
+#: DOCUMENTED CONTRACT with scripts/whatsapp-bridge/bridge_helpers.js
+#: (``BRIDGE_EXIT_LOGGED_OUT``). A fresh runtime wire verdict maps to this code
+#: only for explicit nested ``device_removed`` evidence. Startup separately
+#: maps any present revocation-marker entry to this code—including malformed,
+#: unreadable, or nonregular state—because marker presence deliberately fails
+#: closed. A bare status-401 close is NOT terminal: 401s are also emitted by
+#: on to reconnect and stay healthy, so the bridge reconnects through them.
+#: Respawning cannot fix a real revocation, so this code maps to a
+#: NON-RETRYABLE fatal; every other non-zero exit stays retryable.
+#: 78 is sysexits.h EX_CONFIG ("configuration error") — the closest standard
+#: sense of "this install needs operator action, not a retry".
+BRIDGE_EXIT_LOGGED_OUT = 78
+#: Mirrors scripts/whatsapp-bridge/bridge_helpers.js::BRIDGE_EXIT_REPAIR_REQUIRED.
+#: A managed (non-tty) child exits with this instead of rendering a pairing QR
+#: into bridge.log. Terminal, like a revocation.
+BRIDGE_EXIT_REPAIR_REQUIRED = 79
+
+#: Message for the terminal logged-out case, used by both the runtime-exit
+#: check and the startup health loop.
+_LOGGED_OUT_MESSAGE = (
+    "WhatsApp logged this device out (session revoked) — the bridge cannot "
+    f"reconnect. {_REPAIR_HINT}"
+)
+
+
+#: Re-exported so this module keeps a single, obvious name for the check.
+#:
+#: The parser itself lives in ``gateway.platforms.whatsapp_common`` because
+#: three layers act on the same marker — this adapter (refuse to retry), the
+#: CLI and the dashboard (offer to wipe the session) — and the CLI and
+#: dashboard must be able to read it without importing this adapter.  One
+#: parser, so the destructive and the defensive readings cannot drift apart.
+#:
+#: The marker exists because the bridge's exit code is not always observable.
+#: On the supported reuse path the bridge belongs to somebody else and we
+#: never see a ``returncode`` at all; and once the gateway itself restarts,
+#: the exit code is gone.  The marker outlives both.
+is_session_revoked = is_whatsapp_session_revoked
+
+
+_MAX_SAVED_CREDENTIAL_BYTES = 1024 * 1024
+#: Saved WhatsApp credentials are owner read/write only, exactly.
+_CREDENTIAL_FILE_MODE = 0o600
+_INVALID_CREDENTIAL_RESULT = (
+    "whatsapp_credentials_invalid",
+    f"WhatsApp saved credentials are unavailable or invalid. {_REPAIR_HINT}",
+)
+
+
+class _SavedCredentialsAbsent(Exception):
+    """The credential directory entry was genuinely absent at first inspection."""
+
+
+class _SavedCredentialsInvalid(Exception):
+    """Present credential state could not be read as one stable regular file."""
+
+
+def _credential_stat_fingerprint(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _read_saved_credentials(creds_path: Path) -> str:
+    """Read bounded credentials without following or blocking on local state."""
+    try:
+        path_stat = creds_path.lstat()
+    except FileNotFoundError as exc:
+        raise _SavedCredentialsAbsent from exc
+    except OSError as exc:
+        raise _SavedCredentialsInvalid from exc
+    if not stat.S_ISREG(path_stat.st_mode):
+        raise _SavedCredentialsInvalid
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        fd = os.open(creds_path, flags)
+    except OSError as exc:
+        # ENOENT here is a substitution race, not initial absence.
+        raise _SavedCredentialsInvalid from exc
+    try:
+        opened_stat = os.fstat(fd)
+        if (
+            not stat.S_ISREG(opened_stat.st_mode)
+            or _credential_stat_fingerprint(opened_stat)
+            != _credential_stat_fingerprint(path_stat)
+            or opened_stat.st_size < 0
+            or opened_stat.st_size > _MAX_SAVED_CREDENTIAL_BYTES
+        ):
+            raise _SavedCredentialsInvalid
+        # Owner-only state. Type and identity are not enough: a credential
+        # file readable by group/other is already disclosed, and one owned by
+        # another user is not ours to trust. Both are checked on the open
+        # descriptor so the verdict cannot be raced after the fact.
+        if hasattr(os, "getuid") and opened_stat.st_uid != os.getuid():
+            raise _SavedCredentialsInvalid
+        if stat.S_IMODE(opened_stat.st_mode) != _CREDENTIAL_FILE_MODE:
+            raise _SavedCredentialsInvalid
+
+        payload = bytearray()
+        while len(payload) <= _MAX_SAVED_CREDENTIAL_BYTES:
+            chunk = os.read(
+                fd,
+                min(
+                    64 * 1024,
+                    _MAX_SAVED_CREDENTIAL_BYTES + 1 - len(payload),
+                ),
+            )
+            if not chunk:
+                break
+            payload.extend(chunk)
+        final_stat = os.fstat(fd)
+        if (
+            len(payload) > _MAX_SAVED_CREDENTIAL_BYTES
+            or _credential_stat_fingerprint(final_stat)
+            != _credential_stat_fingerprint(opened_stat)
+            or len(payload) != final_stat.st_size
+        ):
+            raise _SavedCredentialsInvalid
+    except OSError as exc:
+        raise _SavedCredentialsInvalid from exc
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    try:
+        return payload.decode("utf-8")
+    except UnicodeError as exc:
+        raise _SavedCredentialsInvalid from exc
+
+
+def classify_saved_credentials(creds_path: Path) -> Optional[tuple]:
+    """Return ``(fatal_code, message)`` when saved creds cannot be attempted, else ``None``.
+
+    This is a *static* preflight only: it exists to skip the ~30s bridge
+    bootstrap when creds.json is missing, unreadable, or not a parseable
+    JSON object — cases where the bridge could not possibly connect.
+
+    It must NOT infer live pairing/revocation state from the ``registered``
+    field. Baileys writes that field as soon as an auth state is
+    initialised — before any QR is scanned — and it was assumed WhatsApp
+    also leaves it ``false`` after revoking a device. That assumption does
+    not hold: a freshly paired session reaches ``connection: open`` and stays
+    connected while its creds.json still reports ``registered: false``. A
+    static check that rejects on that field would block sessions that can
+    actually connect. Whether a parseable session can connect is decided live by the
+    bridge; a genuine revocation is still caught at runtime via exit code
+    ``BRIDGE_EXIT_LOGGED_OUT`` (see ``_mark_fatal_if_logged_out``), which
+    stays non-retryable.
+
+    The one static verdict that *is* trustworthy is a revocation marker left
+    by a previous run: checked first, because it is both more specific and
+    more actionable than anything the credential file can tell us — the
+    creds there are typically intact and simply will not be accepted again.
+    """
+    if is_session_revoked(creds_path.parent):
+        return ("whatsapp_logged_out", _LOGGED_OUT_MESSAGE)
+
+    try:
+        raw = _read_saved_credentials(creds_path)
+    except _SavedCredentialsAbsent:
+        return (
+            "whatsapp_not_paired",
+            f"WhatsApp is enabled but not paired (no saved credentials). {_REPAIR_HINT}",
+        )
+    except _SavedCredentialsInvalid:
+        return _INVALID_CREDENTIAL_RESULT
+
+    try:
+        creds = json.loads(raw)
+    except ValueError:
+        return _INVALID_CREDENTIAL_RESULT
+
+    if not isinstance(creds, dict):
+        return _INVALID_CREDENTIAL_RESULT
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Managed-start gate and the bridge log descriptor.
+#
+# The managed bridge is spawned with stdout/stderr pointed at bridge.log, and
+# an unpaired or revoked child prints a live pairing QR on stdout. Two
+# independent boundaries keep authentication material out of that file:
+#
+#   1. the managed gateway only starts from an already-valid paired session
+#      (here), so the child that would print a QR is never spawned; and
+#   2. the bridge suppresses QR rendering when stdout is not a terminal
+#      (scripts/whatsapp-bridge/bridge.js), because the parent cannot react
+#      before the child has already written to the descriptor it was given.
+#
+# The adapter gate alone cannot enforce non-persistence: a session can be
+# revoked server-side while the gateway is running, so the child may reach a
+# QR state after a legitimate start. That is why bridge.js is also patched.
+# ---------------------------------------------------------------------------
+
+#: Fixed status for any managed start that is not demonstrably paired. It
+#: names no path, session, or identity — the operator already knows which
+#: profile they ran, and the remedy is the same in every case.
+_REPAIR_REQUIRED_STATUS = (
+    "whatsapp_repair_required",
+    "WhatsApp needs to be paired again before the gateway can use it.",
+)
+
+_BRIDGE_LOG_MODE = 0o600
+
+
+class WhatsAppBridgeLogError(Exception):
+    """The managed bridge log could not be opened as private local state."""
+
+
+def saved_credentials_identity_is_complete(payload: object) -> bool:
+    """True when the payload carries a non-empty ``me.id`` account identity.
+
+    This — not ``registered`` — is the paired verdict. Baileys writes
+    ``registered`` as soon as an auth state is initialised, before any QR is
+    scanned, and a freshly paired session can stay connected while still
+    reporting it ``false``; so it says nothing about whether a pairing
+    completed. A ``me.id`` is only written once an account is actually linked.
+    """
+    if not isinstance(payload, dict):
+        return False
+    me = payload.get("me")
+    if not isinstance(me, dict):
+        return False
+    account_id = me.get("id")
+    return isinstance(account_id, str) and bool(account_id.strip())
+
+
+def managed_start_is_permitted(session_path: Path) -> bool:
+    """Return True only when a managed bridge may start from saved credentials.
+
+    Fails closed: absent, revoked, unparseable, non-owner, wrongly-permissioned
+    or identity-less session state all mean "not permitted", so the child that
+    would print a pairing QR into bridge.log is never spawned. A parseable JSON
+    object is *not* sufficient — ``{}`` parses fine and is not a paired session.
+    """
+    creds_path = Path(session_path) / "creds.json"
+    try:
+        if classify_saved_credentials(creds_path) is not None:
+            return False
+        # Re-read through the same hardened reader (owner + exact 0600 +
+        # pre/post identity) and require a completed account identity.
+        return saved_credentials_identity_is_complete(
+            json.loads(_read_saved_credentials(creds_path))
+        )
+    except Exception:
+        return False
+
+
+def managed_start_refusal_status(session_path: Path) -> tuple[str, str]:
+    """Return the fixed, value-free status for a refused managed start."""
+    return _REPAIR_REQUIRED_STATUS
+
+
+def open_bridge_log(log_path: Path):
+    """Open the managed bridge log as an owner-only regular file, mode 0600.
+
+    A plain ``open(path, "a")`` follows symlinks, creates at ``0666 & ~umask``
+    (normally world-readable ``0644``), and cannot notice that the entry it
+    inspected is not the entry it opened. Because the bridge's stdout lands
+    here, that combination turns an attacker-planted symlink into an append
+    primitive and leaves pairing-adjacent output world-readable.
+
+    Errors are fixed strings: the path, the errno text, and any file content
+    would themselves disclose local state.
+    """
+    log_path = Path(log_path)
+
+    # Inspect without following. An absent entry is the normal first-run case;
+    # anything present that is not a regular file is refused outright, so the
+    # symlink target is never opened, truncated, or appended to.
+    try:
+        pre_stat = log_path.lstat()
+    except FileNotFoundError:
+        pre_stat = None
+    except OSError as exc:
+        raise WhatsAppBridgeLogError(
+            "The WhatsApp bridge log could not be inspected."
+        ) from exc
+    if pre_stat is not None and not stat.S_ISREG(pre_stat.st_mode):
+        raise WhatsAppBridgeLogError(
+            "The WhatsApp bridge log is not a regular file."
+        )
+
+    base_flags = (
+        os.O_WRONLY
+        | os.O_APPEND
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        # O_NONBLOCK covers the residual race: if the entry is replaced by a
+        # FIFO after the lstat above, a blocking write-only open would hang
+        # the gateway forever waiting for a reader.
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    if pre_stat is None:
+        # The entry was absent, so we must be the one who creates it.
+        # A plain O_CREAT would happily adopt whatever appeared in the window
+        # between the lstat above and this open — including a hardlink to a
+        # file owned by someone else — and there is no earlier fingerprint to
+        # compare it against. O_EXCL closes that window: creation either wins
+        # outright or fails, and a loser never writes.
+        try:
+            fd = os.open(log_path, base_flags | os.O_CREAT | os.O_EXCL, _BRIDGE_LOG_MODE)
+        except FileExistsError as exc:
+            raise WhatsAppBridgeLogError(
+                "The WhatsApp bridge log appeared while it was being created."
+            ) from exc
+        except OSError as exc:
+            raise WhatsAppBridgeLogError(
+                "The WhatsApp bridge log could not be created."
+            ) from exc
+    else:
+        # The entry was inspected as a regular file; reopen it and prove below
+        # that it is still the same one.
+        try:
+            fd = os.open(log_path, base_flags)
+        except OSError as exc:
+            raise WhatsAppBridgeLogError(
+                "The WhatsApp bridge log could not be opened."
+            ) from exc
+
+    try:
+        opened_stat = os.fstat(fd)
+        if not stat.S_ISREG(opened_stat.st_mode):
+            raise WhatsAppBridgeLogError(
+                "The WhatsApp bridge log is not a regular file."
+            )
+        # The entry inspected must be the entry opened.
+        if pre_stat is not None and (
+            opened_stat.st_dev,
+            opened_stat.st_ino,
+        ) != (pre_stat.st_dev, pre_stat.st_ino):
+            raise WhatsAppBridgeLogError(
+                "The WhatsApp bridge log changed identity while it was opened."
+            )
+        if hasattr(os, "getuid") and opened_stat.st_uid != os.getuid():
+            raise WhatsAppBridgeLogError(
+                "The WhatsApp bridge log has the wrong owner."
+            )
+        # A log left readable by an earlier run is tightened in place rather
+        # than silently inherited.
+        if stat.S_IMODE(opened_stat.st_mode) != _BRIDGE_LOG_MODE:
+            os.fchmod(fd, _BRIDGE_LOG_MODE)
+            if stat.S_IMODE(os.fstat(fd).st_mode) != _BRIDGE_LOG_MODE:
+                raise WhatsAppBridgeLogError(
+                    "The WhatsApp bridge log has unsafe permissions."
+                )
+        # Clear O_NONBLOCK before the descriptor becomes a child's stdout:
+        # the flag was only needed to survive the FIFO race during open, and
+        # a non-blocking stdout would make the bridge's writes fail with
+        # EAGAIN under load.
+        if hasattr(os, "get_blocking"):
+            os.set_blocking(fd, True)
+    except WhatsAppBridgeLogError:
+        os.close(fd)
+        raise
+    except OSError as exc:
+        os.close(fd)
+        raise WhatsAppBridgeLogError(
+            "The WhatsApp bridge log could not be prepared."
+        ) from exc
+
+    return os.fdopen(fd, "a", encoding="utf-8")
 
 
 class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
@@ -468,6 +879,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # "Fatal whatsapp adapter error" plus dispatch a fatal-error
         # notification before the normal "✓ whatsapp disconnected" fires.
         self._shutting_down: bool = False
+        self._whatsapp_session_lock_registered: bool = False
 
         # Text debounce batching (mirrors Telegram adapter pattern).
         # WhatsApp often delivers multiple messages in rapid succession
@@ -523,65 +935,97 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         
         bridge_path = Path(self._bridge_script)
         if not bridge_path.exists():
-            logger.warning("[%s] Bridge script not found: %s", self.name, bridge_path)
+            logger.warning("[%s] WhatsApp bridge script was not found.", self.name)
             self._set_fatal_error(
                 "whatsapp_bridge_missing",
-                f"WhatsApp bridge script missing at {bridge_path}.",
+                "WhatsApp bridge script is missing.",
                 retryable=False,
             )
             return False
-
-        # Pre-flight: skip the 30s bridge bootstrap entirely if the user
-        # never finished pairing.  Without creds.json the bridge prints
-        # QR codes to its log file and never reaches status:connected,
-        # so every gateway restart paid the 30s timeout + queued WhatsApp
-        # for indefinite retries.  Mark non-retryable so the user gets a
-        # clear pairing message instead of the watcher
-        # silently hammering an unconfigured platform.
-        creds_path = self._session_path / "creds.json"
-        if not creds_path.exists():
+        if not whatsapp_bridge_runtime_hash(bridge_path.parent):
             logger.warning(
-                "[%s] WhatsApp is enabled but not paired (no creds.json at %s). "
-                "Pair from the dashboard or run `hermes whatsapp`; remove "
-                "WHATSAPP_ENABLED from your .env to disable.",
-                self.name, creds_path,
+                "[%s] WhatsApp bridge source inputs are unavailable.", self.name
             )
             self._set_fatal_error(
-                "whatsapp_not_paired",
-                "WhatsApp enabled but not paired — pair from the dashboard or run `hermes whatsapp`.",
+                "whatsapp_bridge_source_invalid",
+                "WhatsApp bridge source inputs are unavailable.",
                 retryable=False,
             )
             return False
 
-        logger.info("[%s] Bridge found at %s", self.name, bridge_path)
-        
-        # Acquire scoped lock to prevent duplicate sessions
+        # Recovery takes this gate before it can delete or recreate auth.
+        # Hold the same gate from the first credentials read until the
+        # long-lived whatsapp-session lock is ours, closing the check/delete
+        # race across CLI, dashboard, and adapter processes.
+        try:
+            connect_gate = acquire_whatsapp_connect_gate(self._session_path)
+        except Exception as exc:
+            logger.warning(
+                "[%s] Could not check the WhatsApp recovery gate (%s).",
+                self.name,
+                type(exc).__name__,
+            )
+            self._set_fatal_error(
+                "whatsapp_recovery_lock",
+                "WhatsApp session recovery coordination is unavailable.",
+                retryable=True,
+            )
+            return False
+        if connect_gate is None:
+            self._set_fatal_error(
+                "whatsapp_recovery_in_progress",
+                "WhatsApp session recovery is in progress.",
+                retryable=True,
+            )
+            return False
+
         lock_acquired = False
         try:
-            if not self._acquire_platform_lock('whatsapp-session', str(self._session_path), 'WhatsApp session'):
+            # Pre-flight: skip the 30s bridge bootstrap entirely when
+            # credentials cannot possibly connect. It must run inside the
+            # recovery gate so reset cannot replace the directory mid-read.
+            creds_path = self._session_path / "creds.json"
+            unusable_creds = classify_saved_credentials(creds_path)
+            if unusable_creds is not None:
+                fatal_code, fatal_message = unusable_creds
+                logger.warning("[%s] %s", self.name, fatal_message)
+                self._set_fatal_error(fatal_code, fatal_message, retryable=False)
+                return False
+
+            logger.info("[%s] Bridge found.", self.name)
+            session_identity = str(
+                self._session_path.expanduser().resolve(strict=False)
+            )
+            validate_whatsapp_session_lock_state(self._session_path)
+            if not self._acquire_platform_lock(
+                'whatsapp-session', session_identity, 'WhatsApp session'
+            ):
                 return False
             lock_acquired = True
-        except Exception as e:
-            logger.warning("[%s] Could not acquire session lock (non-fatal): %s", self.name, e)
+            note_whatsapp_session_lock_acquired(self._session_path)
+            self._whatsapp_session_lock_registered = True
+        except Exception as exc:
+            logger.warning(
+                "[%s] Could not acquire the WhatsApp session lock (%s).",
+                self.name,
+                type(exc).__name__,
+            )
+            self._set_fatal_error(
+                "whatsapp_session_lock_unavailable",
+                "WhatsApp session coordination is unavailable.",
+                retryable=True,
+            )
+            return False
+        finally:
+            connect_gate.release()
 
         try:
-            # Auto-install npm dependencies when node_modules is missing OR
-            # package.json changed since the last install (e.g. after
-            # `hermes update` bumps the Baileys pin).  The stamp file records
-            # the package.json hash of the last successful install.
+            # Auto-install npm dependencies when node_modules is missing or
+            # either dependency manifest changed since the last install (for
+            # example, after `hermes update` bumps the Baileys pin). The stamp
+            # records the composite package.json + package-lock.json hash.
             bridge_dir = bridge_path.parent
-            _pkg_json = bridge_dir / "package.json"
-            _dep_stamp = bridge_dir / "node_modules" / ".hermes-pkg-hash"
-            _pkg_hash = _file_content_hash(_pkg_json)
-            _deps_fresh = False
-            if (bridge_dir / "node_modules").exists():
-                try:
-                    _deps_fresh = (
-                        _dep_stamp.read_text(encoding="utf-8").strip() == _pkg_hash
-                    ) and bool(_pkg_hash)
-                except OSError:
-                    _deps_fresh = False
-            if not _deps_fresh:
+            if not whatsapp_bridge_dependencies_fresh(bridge_dir):
                 print(f"[{self.name}] Installing WhatsApp bridge dependencies...")
                 # Resolve npm path so Windows uses npm.cmd from the
                 # Hermes-managed portable Node before falling back to PATH.
@@ -599,30 +1043,63 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         env=with_hermes_node_path(),
                     )
                     if install_result.returncode != 0:
-                        print(f"[{self.name}] npm install failed: {install_result.stderr}")
+                        print(f"[{self.name}] WhatsApp bridge dependency installation failed.")
                         self._set_fatal_error(
                             "whatsapp_npm_install_failed",
-                            f"WhatsApp bridge npm install failed. Run `cd {bridge_dir} && {_npm_bin} install` manually, then restart `hermes gateway`.",
+                            "WhatsApp bridge npm install failed. Run `npm install` in "
+                            "the WhatsApp bridge directory, then restart `hermes gateway`.",
                             retryable=False,
                         )
                         return False
                     print(f"[{self.name}] Dependencies installed")
-                    if _pkg_hash:
-                        try:
-                            _dep_stamp.write_text(_pkg_hash, encoding="utf-8")
-                        except OSError:
-                            pass  # Stamp is an optimization; install still succeeded
-                except Exception as e:
-                    print(f"[{self.name}] Failed to install dependencies: {e}")
+                    try:
+                        write_whatsapp_bridge_dependency_stamp(bridge_dir)
+                    except OSError:
+                        pass  # Stamp is an optimization; install still succeeded
+                except Exception as exc:
+                    print(f"[{self.name}] WhatsApp bridge dependency installation failed.")
+                    logger.warning(
+                        "[%s] WhatsApp bridge dependency installation failed (%s).",
+                        self.name,
+                        type(exc).__name__,
+                    )
                     self._set_fatal_error(
                         "whatsapp_npm_install_failed",
-                        f"WhatsApp bridge npm install failed ({e}). Run `cd {bridge_dir} && {_npm_bin} install` manually, then restart `hermes gateway`.",
+                        "WhatsApp bridge npm install failed. Run `npm install` in "
+                        "the WhatsApp bridge directory, then restart `hermes gateway`.",
                         retryable=False,
                     )
                     return False
 
-            # Ensure session directory exists
-            self._session_path.mkdir(parents=True, exist_ok=True)
+            # npm may update package-lock.json. Re-read every runtime input
+            # after a successful install so the stamp and the desired health
+            # hash both describe the post-install files. Invalid required
+            # inputs never become authoritative merely because npm returned 0.
+            if not whatsapp_bridge_runtime_hash(bridge_dir):
+                logger.warning(
+                    "[%s] WhatsApp bridge source inputs are unavailable.",
+                    self.name,
+                )
+                self._set_fatal_error(
+                    "whatsapp_bridge_source_invalid",
+                    "WhatsApp bridge source inputs are unavailable.",
+                    retryable=False,
+                )
+                return False
+
+            # Ensure the session directory exists as owner-only state. It
+            # holds Baileys credentials, so 0700 is enforced on creation and
+            # re-verified when it already existed.
+            try:
+                ensure_whatsapp_session_dir(self._session_path)
+            except WhatsAppSessionStateError as exc:
+                logger.error("[%s] %s", self.name, str(exc))
+                self._set_fatal_error(
+                    "whatsapp_session_state_unsafe",
+                    "The WhatsApp session directory could not be used safely.",
+                    retryable=False,
+                )
+                return False
             
             # Check if bridge is already running and connected
             import aiohttp
@@ -637,16 +1114,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             bridge_status = data.get("status", "unknown")
                             if bridge_status == "connected":
                                 # Staleness handshake: only reuse a running
-                                # bridge if it is serving the same bridge.js
-                                # that is on disk right now.  A long-lived
-                                # bridge survives gateway restarts AND
-                                # `hermes update`, so without this check it
-                                # keeps serving pre-update code forever
-                                # (e.g. no inbound media download).  Old
-                                # bridges that don't report scriptHash are
-                                # treated as stale by definition.
-                                running_hash = data.get("scriptHash", "")
-                                disk_hash = _file_content_hash(bridge_path)
+                                # bridge when its composite runtime fingerprint
+                                # matches every allowlisted source/helper and
+                                # both dependency manifests on disk. A bridge
+                                # can survive gateway restarts and `hermes
+                                # update`; missing, legacy-short, or malformed
+                                # health hashes are stale by definition.
+                                running_hash = _reported_bridge_runtime_hash(data)
+                                disk_hash = whatsapp_bridge_runtime_hash(bridge_path.parent)
                                 running_read_receipts = bool(data.get("sendReadReceipts", False))
                                 config_matches = running_read_receipts == self._send_read_receipts
                                 if (
@@ -655,34 +1130,64 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                     and running_hash == disk_hash
                                     and config_matches
                                 ):
-                                    print(f"[{self.name}] Using existing bridge (status: {bridge_status})")
+                                    print(f"[{self.name}] Using the existing WhatsApp bridge.")
                                     self._mark_connected()
                                     self._bridge_process = None  # Not managed by us
                                     self._http_session = aiohttp.ClientSession()
                                     self._poll_task = asyncio.create_task(self._poll_messages())
                                     return True
-                                stale_reason = (
-                                    f"running={running_hash or 'unversioned'}, disk={disk_hash}"
-                                    if running_hash != disk_hash
-                                    else "send_read_receipts config changed"
-                                )
-                                print(f"[{self.name}] Running bridge is stale ({stale_reason}), restarting")
+                                print(f"[{self.name}] Running bridge is stale; restarting.")
                             else:
-                                print(f"[{self.name}] Bridge found but not connected (status: {bridge_status}), restarting")
+                                print(f"[{self.name}] Bridge is not connected; restarting.")
             except Exception:
                 pass  # Bridge not running, start a new one
             
             # Kill any orphaned bridge from a previous gateway run
-            _kill_stale_bridge_by_pidfile(self._session_path)
-            _kill_port_process(self._bridge_port)
+            try:
+                _kill_stale_bridge_by_pidfile(
+                    self._session_path, self._bridge_port, bridge_path
+                )
+                _kill_port_process(self._bridge_port, self._session_path, bridge_path)
+            except WhatsAppBridgeOwnershipError as exc:
+                logger.warning(
+                    "[%s] Refused unsafe WhatsApp bridge cleanup (%s).",
+                    self.name,
+                    type(exc).__name__,
+                )
+                self._set_fatal_error(
+                    "whatsapp_bridge_ownership_unverified",
+                    "WhatsApp bridge startup was blocked because its listener could not be verified.",
+                    retryable=True,
+                )
+                return False
             await asyncio.sleep(1)
             
             # Start the bridge process in its own process group.
             # Route output to a log file so QR codes, errors, and reconnection
             # messages are preserved for troubleshooting.
             whatsapp_mode = _wenv("WHATSAPP_MODE", "self-chat")
+
+            # Managed-start gate: only an already-valid paired session may
+            # spawn a bridge. An unpaired/revoked child prints a live pairing
+            # QR on the stdout we are about to point at bridge.log, so the
+            # refusal has to happen before the spawn, not after.
+            if not managed_start_is_permitted(self._session_path):
+                _code, _message = managed_start_refusal_status(self._session_path)
+                logger.error("[%s] %s", self.name, _message)
+                self._set_fatal_error(_code, _message, retryable=False)
+                return False
+
             self._bridge_log = self._session_path.parent / "bridge.log"
-            bridge_log_fh = open(self._bridge_log, "a", encoding="utf-8")
+            try:
+                bridge_log_fh = open_bridge_log(self._bridge_log)
+            except WhatsAppBridgeLogError as exc:
+                logger.error("[%s] %s", self.name, str(exc))
+                self._set_fatal_error(
+                    "whatsapp_bridge_log_unsafe",
+                    "The WhatsApp bridge log could not be opened safely.",
+                    retryable=False,
+                )
+                return False
             self._bridge_log_fh = bridge_log_fh
 
             # Build bridge subprocess environment.
@@ -756,8 +1261,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             for attempt in range(15):
                 await asyncio.sleep(1)
                 if self._bridge_process.poll() is not None:
-                    print(f"[{self.name}] Bridge process died (exit code {self._bridge_process.returncode})")
-                    print(f"[{self.name}] Check log: {self._bridge_log}")
+                    print(f"[{self.name}] Bridge process exited during startup.")
+                    print(f"[{self.name}] Check the WhatsApp bridge log for details.")
+                    self._mark_fatal_if_logged_out(self._bridge_process.returncode)
                     self._close_bridge_log()
                     return False
                 try:
@@ -770,26 +1276,27 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 http_ready = True
                                 data = await resp.json()
                                 if data.get("status") == "connected":
-                                    print(f"[{self.name}] Bridge ready (status: connected)")
+                                    print(f"[{self.name}] Bridge is ready.")
                                     break
                 except Exception:
                     continue
 
             if not http_ready:
-                print(f"[{self.name}] Bridge HTTP server did not start in 15s")
-                print(f"[{self.name}] Check log: {self._bridge_log}")
+                print(f"[{self.name}] Bridge HTTP server did not start.")
+                print(f"[{self.name}] Check the WhatsApp bridge log for details.")
                 self._close_bridge_log()
                 return False
             
             # Phase 2: HTTP is up but WhatsApp may still be connecting.
             # Give it more time to authenticate with saved credentials.
             if data.get("status") != "connected":
-                print(f"[{self.name}] Bridge HTTP ready, waiting for WhatsApp connection...")
+                print(f"[{self.name}] Waiting for the WhatsApp connection...")
                 for attempt in range(15):
                     await asyncio.sleep(1)
                     if self._bridge_process.poll() is not None:
-                        print(f"[{self.name}] Bridge process died during connection")
-                        print(f"[{self.name}] Check log: {self._bridge_log}")
+                        print(f"[{self.name}] Bridge process exited during startup.")
+                        print(f"[{self.name}] Check the WhatsApp bridge log for details.")
+                        self._mark_fatal_if_logged_out(self._bridge_process.returncode)
                         self._close_bridge_log()
                         return False
                     try:
@@ -801,16 +1308,16 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 if resp.status == 200:
                                     data = await resp.json()
                                     if data.get("status") == "connected":
-                                        print(f"[{self.name}] Bridge ready (status: connected)")
+                                        print(f"[{self.name}] Bridge is ready.")
                                         break
                     except Exception:
                         continue
                 else:
                     # Still not connected — warn but proceed (bridge may
                     # auto-reconnect later, e.g. after a code 515 restart).
-                    print(f"[{self.name}] ⚠ WhatsApp not connected after 30s")
-                    print(f"[{self.name}]   Bridge log: {self._bridge_log}")
-                    print(f"[{self.name}]   If session expired, re-pair: hermes whatsapp")
+                    print(f"[{self.name}] WhatsApp is not connected yet.")
+                    print(f"[{self.name}] Check the WhatsApp bridge log for details.")
+                    print(f"[{self.name}] If the session expired, re-pair with `hermes whatsapp`.")
             
             # Create a persistent HTTP session for all bridge communication
             self._http_session = aiohttp.ClientSession()
@@ -819,16 +1326,20 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             self._poll_task = asyncio.create_task(self._poll_messages())
             
             self._mark_connected()
-            print(f"[{self.name}] Bridge started on port {self._bridge_port}")
+            print(f"[{self.name}] Bridge started.")
             return True
-            
-        except Exception as e:
-            logger.error("[%s] Failed to start bridge: %s", self.name, e, exc_info=True)
+
+        except Exception as exc:
+            logger.error(
+                "[%s] Failed to start the WhatsApp bridge (%s).",
+                self.name,
+                type(exc).__name__,
+            )
             return False
         finally:
             if not self._running:
                 if lock_acquired:
-                    self._release_platform_lock()
+                    self._release_whatsapp_session_lock()
                 self._close_bridge_log()
     
     def _close_bridge_log(self) -> None:
@@ -840,8 +1351,72 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 pass
             self._bridge_log_fh = None
 
+    def _mark_fatal_if_logged_out(self, returncode) -> bool:
+        """Flag a terminal logged-out exit seen during the startup handshake.
+
+        The bridge can be revoked mid-handshake, before it ever reports
+        healthy.  Without this, ``connect()`` returned False with no fatal
+        error set, so the reconnect watcher re-spawned a bridge that WhatsApp
+        would revoke again.  Ordinary startup crashes keep their existing
+        (retryable) handling and are deliberately left untouched here.
+        """
+        # A managed child that reached a QR state stopped itself rather than
+        # rendering pairing material into bridge.log. Treat it exactly like a
+        # revocation: terminal, and reported only as generic re-pair state.
+        if returncode == BRIDGE_EXIT_REPAIR_REQUIRED:
+            _code, _message = _REPAIR_REQUIRED_STATUS
+            logger.error("[%s] %s", self.name, _message)
+            self._set_fatal_error(_code, _message, retryable=False)
+            return True
+        if returncode != BRIDGE_EXIT_LOGGED_OUT:
+            return False
+        logger.error("[%s] %s", self.name, _LOGGED_OUT_MESSAGE)
+        self._set_fatal_error("whatsapp_logged_out", _LOGGED_OUT_MESSAGE, retryable=False)
+        return True
+
+    async def _report_fatal_once(self, code: str, message: str, *, retryable: bool) -> str:
+        """Set a fatal error, notify the operator, and do it only once.
+
+        Every send() and each turn of the poll loop runs the exit check, so
+        without the has_fatal_error guard a dead bridge would fire one
+        notification per call.
+        """
+        if not self.has_fatal_error:
+            logger.error("[%s] %s", self.name, message)
+            self._set_fatal_error(code, message, retryable=retryable)
+            self._close_bridge_log()
+            await self._notify_fatal_error()
+        return self.fatal_error_message or message
+
     async def _check_managed_bridge_exit(self) -> Optional[str]:
-        """Return a fatal error message if the managed bridge child exited."""
+        """Return a fatal error message if the bridge is dead or revoked."""
+        # Planned shutdown is not a failure to report — checked before
+        # anything else so a teardown never manufactures a fatal error.
+        # getattr-with-default keeps tests that construct the adapter via
+        # ``WhatsAppAdapter.__new__`` (bypassing __init__) working without
+        # every _make_adapter() helper having to seed the attribute.
+        shutting_down = getattr(self, "_shutting_down", False)
+
+        if not shutting_down and whatsapp_recovery_is_active(self._session_path):
+            return await self._report_fatal_once(
+                "whatsapp_recovery_in_progress",
+                "WhatsApp session recovery requested; disconnecting the bridge.",
+                retryable=True,
+            )
+
+        # A durable revocation marker outranks the process check and is
+        # deliberately independent of it. On the supported reuse path
+        # (_bridge_process is None) the bridge is somebody else's child and
+        # we never observe an exit code, so the exit-code check below is
+        # structurally blind there — this was the gap that let the gateway
+        # keep driving a revoked session forever. It also covers the window
+        # where a managed child has already written the marker but poll()
+        # has not yet caught its exit.
+        if not shutting_down and is_session_revoked(self._session_path):
+            return await self._report_fatal_once(
+                "whatsapp_logged_out", _LOGGED_OUT_MESSAGE, retryable=False
+            )
+
         if self._bridge_process is None:
             return None
 
@@ -853,24 +1428,22 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # SIGTERM to the bridge, so a returncode of -15 (SIGTERM), -2 (SIGINT),
         # or 0 (clean exit) at that point is expected, not a crash. Treat it
         # as informational and skip the fatal-error path.
-        # getattr-with-default keeps tests that construct the adapter via
-        # ``WhatsAppAdapter.__new__`` (bypassing __init__) working without
-        # every _make_adapter() helper having to seed the attribute.
-        if getattr(self, "_shutting_down", False) and returncode in {0, -2, -15}:
-            logger.info(
-                "[%s] Bridge exited during shutdown (code %d).",
-                self.name,
-                returncode,
-            )
+        if shutting_down and returncode in {0, -2, -15}:
+            logger.info("[%s] Bridge exited during shutdown.", self.name)
             return None
 
-        message = f"WhatsApp bridge process exited unexpectedly (code {returncode})."
-        if not self.has_fatal_error:
-            logger.error("[%s] %s", self.name, message)
-            self._set_fatal_error("whatsapp_bridge_exited", message, retryable=True)
-            self._close_bridge_log()
-            await self._notify_fatal_error()
-        return self.fatal_error_message or message
+        # Exit 78 is terminal: either the fresh wire carried explicit nested
+        # device_removed evidence, or startup found a present marker that had
+        # to fail closed. Retrying cannot progress in either case. Every other
+        # non-zero exit is an ordinary crash and stays retryable.
+        if returncode == BRIDGE_EXIT_LOGGED_OUT:
+            code, message, retryable = "whatsapp_logged_out", _LOGGED_OUT_MESSAGE, False
+        else:
+            code = "whatsapp_bridge_exited"
+            message = "WhatsApp bridge process exited unexpectedly."
+            retryable = True
+
+        return await self._report_fatal_once(code, message, retryable=retryable)
 
     async def disconnect(self) -> None:
         """Stop the WhatsApp bridge and clean up any orphaned processes."""
@@ -890,8 +1463,13 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         _terminate_bridge_process(self._bridge_process, force=True)
                     except (ProcessLookupError, PermissionError):
                         self._bridge_process.kill()
-            except Exception as e:
-                print(f"[{self.name}] Error stopping bridge: {e}")
+            except Exception as exc:
+                print(f"[{self.name}] Could not stop the WhatsApp bridge cleanly.")
+                logger.warning(
+                    "[%s] Could not stop the WhatsApp bridge cleanly (%s).",
+                    self.name,
+                    type(exc).__name__,
+                )
         else:
             # Bridge was not started by us, don't kill it
             print(f"[{self.name}] Disconnecting (external bridge left running)")
@@ -916,12 +1494,22 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             await self._http_session.close()
         self._http_session = None
 
-        self._release_platform_lock()
+        self._release_whatsapp_session_lock()
 
         self._mark_disconnected()
         self._bridge_process = None
         self._close_bridge_log()
         print(f"[{self.name}] Disconnected")
+
+    def _release_whatsapp_session_lock(self) -> None:
+        """Release the scoped session lock and same-process ownership note."""
+        registered = getattr(self, "_whatsapp_session_lock_registered", False)
+        try:
+            self._release_platform_lock()
+        finally:
+            if registered:
+                note_whatsapp_session_lock_released(self._session_path)
+                self._whatsapp_session_lock_registered = False
     
     async def send(
         self,
@@ -976,8 +1564,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         if last_message_id:
                             sent_message_ids.append(str(last_message_id))
                     else:
-                        error = await resp.text()
-                        return SendResult(success=False, error=error)
+                        return SendResult(
+                            success=False,
+                            error=_http_error_message(
+                                "WhatsApp message send failed", resp.status
+                            ),
+                        )
 
                 # Small delay between chunks to avoid rate limiting
                 if len(chunks) > 1:
@@ -989,8 +1581,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 continuation_message_ids=tuple(sent_message_ids[:-1]),
                 raw_response={"message_ids": sent_message_ids},
             )
-        except Exception as e:
-            return SendResult(success=False, error=str(e))
+        except Exception:
+            return SendResult(
+                success=False,
+                error="WhatsApp message send failed.",
+            )
 
     async def edit_message(
         self,
@@ -1020,10 +1615,17 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 if resp.status == 200:
                     return SendResult(success=True, message_id=message_id)
                 else:
-                    error = await resp.text()
-                    return SendResult(success=False, error=error)
-        except Exception as e:
-            return SendResult(success=False, error=str(e))
+                    return SendResult(
+                        success=False,
+                        error=_http_error_message(
+                            "WhatsApp message edit failed", resp.status
+                        ),
+                    )
+        except Exception:
+            return SendResult(
+                success=False,
+                error="WhatsApp message edit failed.",
+            )
 
     async def _send_media_to_bridge(
         self,
@@ -1043,7 +1645,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             import aiohttp
 
             if not os.path.exists(file_path):
-                return SendResult(success=False, error=f"File not found: {file_path}")
+                return SendResult(
+                    success=False,
+                    error="WhatsApp media file was not found.",
+                )
 
             payload: Dict[str, Any] = {
                 "chatId": to_whatsapp_jid(chat_id),
@@ -1068,11 +1673,18 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         raw_response=data,
                     )
                 else:
-                    error = await resp.text()
-                    return SendResult(success=False, error=error)
+                    return SendResult(
+                        success=False,
+                        error=_http_error_message(
+                            "WhatsApp media send failed", resp.status
+                        ),
+                    )
 
-        except Exception as e:
-            return SendResult(success=False, error=str(e))
+        except Exception:
+            return SendResult(
+                success=False,
+                error="WhatsApp media send failed.",
+            )
 
     async def send_poll(
         self,
@@ -1114,10 +1726,17 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         message_id=data.get("messageId"),
                         raw_response=data,
                     )
-                error = await resp.text()
-                return SendResult(success=False, error=error)
-        except Exception as e:
-            return SendResult(success=False, error=str(e))
+                return SendResult(
+                    success=False,
+                    error=_http_error_message(
+                        "WhatsApp poll send failed", resp.status
+                    ),
+                )
+        except Exception:
+            return SendResult(
+                success=False,
+                error="WhatsApp poll send failed.",
+            )
 
     async def send_clarify(
         self,
@@ -1147,9 +1766,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             if result.success:
                 return result
             logger.warning(
-                "[%s] Native WhatsApp clarify poll failed; falling back to text: %s",
+                "[%s] Native WhatsApp clarify poll failed; falling back to text.",
                 self.name,
-                result.error,
             )
         return await super().send_clarify(
             chat_id=chat_id,
@@ -1201,10 +1819,17 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         message_id=data.get("messageId"),
                         raw_response=data,
                     )
-                error = await resp.text()
-                return SendResult(success=False, error=error)
-        except Exception as e:
-            return SendResult(success=False, error=str(e))
+                return SendResult(
+                    success=False,
+                    error=_http_error_message(
+                        "WhatsApp location send failed", resp.status
+                    ),
+                )
+        except Exception:
+            return SendResult(
+                success=False,
+                error="WhatsApp location send failed.",
+            )
 
     async def send_image(
         self,
@@ -1302,7 +1927,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if not self._running or not self._http_session:
             return {"name": "Unknown", "type": "dm"}
         if await self._check_managed_bridge_exit():
-            return {"name": chat_id, "type": "dm"}
+            return {"name": "Unknown", "type": "dm"}
         
         try:
             import aiohttp
@@ -1318,10 +1943,13 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         "type": "group" if data.get("isGroup") else "dm",
                         "participants": data.get("participants", []),
                     }
-        except Exception as e:
-            logger.debug("Could not get WhatsApp chat info for %s: %s", chat_id, e)
-        
-        return {"name": chat_id, "type": "dm"}
+        except Exception as exc:
+            logger.debug(
+                "Could not get WhatsApp chat info (%s).",
+                type(exc).__name__,
+            )
+
+        return {"name": "Unknown", "type": "dm"}
     
     async def _poll_messages(self) -> None:
         """Poll the bridge for incoming messages."""
@@ -1354,12 +1982,17 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                     await self.handle_message(event)
             except asyncio.CancelledError:
                 break
-            except Exception as e:
+            except Exception as exc:
                 bridge_exit = await self._check_managed_bridge_exit()
                 if bridge_exit:
                     print(f"[{self.name}] {bridge_exit}")
                     break
-                print(f"[{self.name}] Poll error: {e}")
+                print(f"[{self.name}] WhatsApp message polling failed; retrying.")
+                logger.warning(
+                    "[%s] WhatsApp message polling failed (%s).",
+                    self.name,
+                    type(exc).__name__,
+                )
                 await asyncio.sleep(5)
             
             await asyncio.sleep(1)  # Poll interval
@@ -1380,13 +2013,13 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 timeout=aiohttp.ClientTimeout(total=5),
             ) as resp:
                 if resp.status != 200:
-                    logger.warning(
-                        "[%s] WhatsApp read receipt failed with HTTP %s",
-                        self.name,
-                        resp.status,
-                    )
+                    logger.warning("[%s] WhatsApp read receipt failed.", self.name)
         except Exception as exc:
-            logger.warning("[%s] WhatsApp read receipt failed: %s", self.name, exc)
+            logger.warning(
+                "[%s] WhatsApp read receipt failed (%s).",
+                self.name,
+                type(exc).__name__,
+            )
 
     # ── Text debounce batching ──────────────────────────────────────
 
@@ -1499,9 +2132,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         cached_path = await cache_image_from_url(url, ext=".jpg")
                         cached_urls.append(cached_path)
                         media_types.append(bridge_mime or "image/jpeg")
-                        print(f"[{self.name}] Cached user image: {cached_path}", flush=True)
-                    except Exception as e:
-                        print(f"[{self.name}] Failed to cache image: {e}", flush=True)
+                        print(f"[{self.name}] Cached an inbound image.", flush=True)
+                    except Exception:
+                        print(f"[{self.name}] Failed to cache an inbound image.", flush=True)
                         cached_urls.append(url)
                         media_types.append(bridge_mime or "image/jpeg")
                 elif msg_type == MessageType.PHOTO and os.path.isabs(url):
@@ -1509,17 +2142,17 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     if _is_allowed_bridge_path(url):
                         cached_urls.append(url)
                         media_types.append(bridge_mime or "image/jpeg")
-                        print(f"[{self.name}] Using bridge-cached image: {url}", flush=True)
+                        print(f"[{self.name}] Using a bridge-cached image.", flush=True)
                     else:
-                        print(f"[{self.name}] Rejected bridge image path outside cache dir: {url}", flush=True)
+                        print(f"[{self.name}] Rejected an image outside the media cache.", flush=True)
                 elif msg_type in {MessageType.VOICE, MessageType.AUDIO} and url.startswith(("http://", "https://")):
                     try:
                         cached_path = await cache_audio_from_url(url, ext=".ogg")
                         cached_urls.append(cached_path)
                         media_types.append(bridge_mime or ("audio/ogg" if msg_type == MessageType.VOICE else "audio/mpeg"))
-                        print(f"[{self.name}] Cached user audio: {cached_path}", flush=True)
-                    except Exception as e:
-                        print(f"[{self.name}] Failed to cache audio: {e}", flush=True)
+                        print(f"[{self.name}] Cached inbound audio.", flush=True)
+                    except Exception:
+                        print(f"[{self.name}] Failed to cache inbound audio.", flush=True)
                         cached_urls.append(url)
                         media_types.append(bridge_mime or ("audio/ogg" if msg_type == MessageType.VOICE else "audio/mpeg"))
                 elif msg_type in {MessageType.VOICE, MessageType.AUDIO} and os.path.isabs(url):
@@ -1527,9 +2160,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     if _is_allowed_bridge_path(url):
                         cached_urls.append(url)
                         media_types.append(bridge_mime or ("audio/ogg" if msg_type == MessageType.VOICE else "audio/mpeg"))
-                        print(f"[{self.name}] Using bridge-cached audio: {url}", flush=True)
+                        print(f"[{self.name}] Using bridge-cached audio.", flush=True)
                     else:
-                        print(f"[{self.name}] Rejected bridge audio path outside cache dir: {url}", flush=True)
+                        print(f"[{self.name}] Rejected audio outside the media cache.", flush=True)
                 elif msg_type == MessageType.DOCUMENT and os.path.isabs(url):
                     # Local file path — bridge already downloaded the document
                     if _is_allowed_bridge_path(url):
@@ -1537,16 +2170,16 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         ext = Path(url).suffix.lower()
                         mime = bridge_mime or SUPPORTED_DOCUMENT_TYPES.get(ext, "application/octet-stream")
                         media_types.append(mime)
-                        print(f"[{self.name}] Using bridge-cached document: {url}", flush=True)
+                        print(f"[{self.name}] Using a bridge-cached document.", flush=True)
                     else:
-                        print(f"[{self.name}] Rejected bridge document path outside cache dir: {url}", flush=True)
+                        print(f"[{self.name}] Rejected a document outside the media cache.", flush=True)
                 elif msg_type == MessageType.VIDEO and os.path.isabs(url):
                     if _is_allowed_bridge_path(url):
                         cached_urls.append(url)
                         media_types.append(bridge_mime or "video/mp4")
-                        print(f"[{self.name}] Using bridge-cached video: {url}", flush=True)
+                        print(f"[{self.name}] Using a bridge-cached video.", flush=True)
                     else:
-                        print(f"[{self.name}] Rejected bridge video path outside cache dir: {url}", flush=True)
+                        print(f"[{self.name}] Rejected a video outside the media cache.", flush=True)
                 else:
                     cached_urls.append(url)
                     media_types.append("unknown")
@@ -1592,7 +2225,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         try:
                             file_size = Path(doc_path).stat().st_size
                             if file_size > MAX_TEXT_INJECT_BYTES:
-                                print(f"[{self.name}] Skipping text injection for {doc_path} ({file_size} bytes > {MAX_TEXT_INJECT_BYTES})", flush=True)
+                                print(f"[{self.name}] Skipping oversized document text injection.", flush=True)
                                 continue
                             content = Path(doc_path).read_text(encoding="utf-8", errors="replace")
                             fname = Path(doc_path).name
@@ -1607,9 +2240,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 body = f"{injection}\n\n{body}"
                             else:
                                 body = injection
-                            print(f"[{self.name}] Injected text content from: {doc_path}", flush=True)
-                        except Exception as e:
-                            print(f"[{self.name}] Failed to read document text: {e}", flush=True)
+                            print(f"[{self.name}] Injected document text content.", flush=True)
+                        except Exception:
+                            print(f"[{self.name}] Failed to read document text.", flush=True)
 
             metadata: Dict[str, Any] = {}
             native_type = str(data.get("nativeType") or "").strip()
@@ -1647,8 +2280,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 reply_to_author_id=reply_to_author_id,
                 reply_to_is_own_message=reply_to_is_own_message,
             )
-        except Exception as e:
-            print(f"[{self.name}] Error building event: {e}")
+        except Exception:
+            print(f"[{self.name}] Failed to build an inbound WhatsApp event.")
             return None
 
 
@@ -1737,8 +2370,11 @@ async def _standalone_send(
                     timeout=aiohttp.ClientTimeout(total=30),
                 ) as resp:
                     if resp.status != 200:
-                        body = await resp.text()
-                        return {"error": f"WhatsApp bridge error ({resp.status}): {body}"}
+                        return {
+                            "error": _http_error_message(
+                                "WhatsApp message send failed", resp.status
+                            )
+                        }
                     data = await resp.json()
                     last_message_id = data.get("messageId")
 
@@ -1763,7 +2399,7 @@ async def _standalone_send(
                                     last_message_id = (await resp.json()).get("messageId")
                         except Exception:
                             logger.warning("WhatsApp caption-fallback send failed for missing media")
-                    return {"error": f"WhatsApp media file not found: {media_path}"}
+                    return {"error": "WhatsApp media file was not found."}
                 media_type = _bridge_media_type(media_path, is_voice, force_document)
                 payload: Dict[str, Any] = {
                     "chatId": normalized_chat_id,
@@ -1780,8 +2416,11 @@ async def _standalone_send(
                     timeout=aiohttp.ClientTimeout(total=120),
                 ) as resp:
                     if resp.status != 200:
-                        body = await resp.text()
-                        return {"error": f"WhatsApp media error ({resp.status}): {body}"}
+                        return {
+                            "error": _http_error_message(
+                                "WhatsApp media send failed", resp.status
+                            )
+                        }
                     data = await resp.json()
                     last_message_id = data.get("messageId") or last_message_id
 
@@ -1791,8 +2430,8 @@ async def _standalone_send(
             "chat_id": normalized_chat_id,
             "message_id": last_message_id,
         }
-    except Exception as e:
-        return {"error": f"WhatsApp send failed: {e}"}
+    except Exception:
+        return {"error": "WhatsApp send failed."}
 
 
 def interactive_setup() -> None:

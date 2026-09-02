@@ -45,6 +45,14 @@ import os
 import sys
 
 _FRONTEND = ("ui-tui/", "web/", "apps/")  # TS typecheck-matrix packages
+# Standalone npm packages: their own package.json + lockfile, deliberately NOT
+# npm workspaces (they are installed on the user's machine, not built here), so
+# workspace discovery in js-tests.yml cannot see them and each gets a dedicated
+# job. They run the frontend lane, but — unlike _FRONTEND — they are NOT added
+# to _PY_SKIP: the WhatsApp bridge's exit codes and revoked-session marker are
+# a contract the Python adapter parses, so a bridge change must keep running
+# the Python suite that checks the other side of it.
+_JS_PACKAGES = ("scripts/whatsapp-bridge/",)
 _ROOT_NPM = {"package.json", "package-lock.json"}  # shifts every package's tree
 _DOCKER_META = ("docker/", ".hadolint.yml", "Dockerfile") # docker setup
 _SITE = ("website/", "skills/", "optional-skills/")  # docs site + skill pages
@@ -131,7 +139,7 @@ def classify(files: list[str]) -> dict[str, bool]:
         "python": any(not _py_irrelevant(f) for f in files),
         "python_prod": any(not _py_irrelevant(f) and not _py_test_only(f) for f in files),
         "docker_meta":  any(f.startswith(_DOCKER_META) for f in files),
-        "frontend": any(f.startswith(_FRONTEND) or f in _ROOT_NPM for f in files),
+        "frontend": any(f.startswith(_FRONTEND + _JS_PACKAGES) or f in _ROOT_NPM for f in files),
         "site": any(f.startswith(_SITE) for f in files),
         "scan": any(_is_scan(f) for f in files),
         "deps": any(f == "pyproject.toml" for f in files),

@@ -1671,6 +1671,30 @@ def _isolate_computer_use_approval_state():
 
 
 @pytest.fixture(autouse=True)
+def _whatsapp_owner_only_umask(request):
+    """Create WhatsApp test credential fixtures owner-only, as a real pair does.
+
+    The credential/session readers require exactly ``0600``. Fixtures that
+    build a session with ``Path.write_text`` inherit the ambient umask, so on
+    a normal ``022`` developer machine they land at ``0644`` — a mode the
+    production code must reject, and which therefore describes an unsafe
+    session rather than the paired one these tests mean to set up.
+
+    Narrowing the umask for WhatsApp modules makes the fixtures match reality.
+    It does not relax any assertion: the mode checks still run, and the tests
+    that deliberately exercise a wrong mode set it explicitly with ``chmod``.
+    """
+    if "whatsapp" not in str(getattr(request.node, "fspath", "")).lower():
+        yield
+        return
+    previous = os.umask(0o077)
+    try:
+        yield
+    finally:
+        os.umask(previous)
+
+
+@pytest.fixture(autouse=True)
 def _moa_caches_isolated():
     """Clear module-level MoA cold-start caches before each test.
 

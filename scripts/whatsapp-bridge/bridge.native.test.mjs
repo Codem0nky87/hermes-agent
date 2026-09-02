@@ -13,6 +13,7 @@ import path from 'node:path';
 import { getAggregateVotesInPollMessage } from '@whiskeysockets/baileys';
 
 import {
+  buildIgnoredMessageEvent,
   buildPollPayload,
   buildTextSendPayload,
   createBoundedMessageStore,
@@ -374,21 +375,31 @@ import {
   // A throwing downloadMedia (expired CDN URL) must not reject out of
   // extractBridgeEvent — before this guard the whole upsert batch died and
   // the message was silently dropped.
-  const event = await extractBridgeEvent({
-    msg: {
-      key: { id: 'img-fail-1', remoteJid: '15551234567@s.whatsapp.net', fromMe: false },
-      messageTimestamp: 123,
-      message: { imageMessage: { caption: '', mimetype: 'image/jpeg' } },
-    },
-    chatId: '15551234567@s.whatsapp.net',
-    senderId: '15551234567@s.whatsapp.net',
-    senderNumber: '15551234567',
-    downloadMedia: async () => { throw new Error('Failed to fetch stream from https://mmg.whatsapp.net/x'); },
-    cacheDirs: { image: mkdtempSync(path.join(tmpdir(), 'wa-media-')) },
-  });
+  const secret = 'SENTINEL_MEDIA_URL_SECRET';
+  const warnings = [];
+  const previousWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(' '));
+  let event;
+  try {
+    event = await extractBridgeEvent({
+      msg: {
+        key: { id: 'img-fail-1', remoteJid: '15551234567@s.whatsapp.net', fromMe: false },
+        messageTimestamp: 123,
+        message: { imageMessage: { caption: '', mimetype: 'image/jpeg' } },
+      },
+      chatId: '15551234567@s.whatsapp.net',
+      senderId: '15551234567@s.whatsapp.net',
+      senderNumber: '15551234567',
+      downloadMedia: async () => { throw new Error(secret); },
+      cacheDirs: { image: mkdtempSync(path.join(tmpdir(), 'wa-media-')) },
+    });
+  } finally {
+    console.warn = previousWarn;
+  }
   assert.equal(event.hasMedia, true);
   assert.equal(event.mediaUrls.length, 0);
   assert.equal(event.body, '[image could not be downloaded]');
+  assert.ok(!warnings.join('\n').includes(secret), 'media errors must not reflect signed URLs or tokens');
   console.log('  ✓ failed media download is contained and surfaced in body');
 }
 
@@ -409,6 +420,61 @@ import {
   assert.equal(event.body, 'see attached\n[document could not be downloaded]');
   assert.equal(event.mediaUrls.length, 0);
   console.log('  ✓ captioned failed download keeps caption and appends note');
+}
+
+// -- ignored-message policy events ----------------------------------------
+//
+// Every message the bridge declines to forward emits one of these lines, on
+// the ordinary (non-debug) stdout stream that Hermes redirects into a log
+// file the dashboard can display. They used to carry `chatId` and `senderId`
+// verbatim, which meant a stranger who merely MESSAGED the operator — and was
+// rejected for it — got their phone number written to that file. The rejection
+// is routine and unattributable to any operator action, so it is the one place
+// the identity is least justified and most voluminous.
+//
+// What an operator acts on is the policy: which rule rejected traffic, and
+// how much. The identity adds nothing to that, so the event carries a fixed,
+// allowlisted reason and NOTHING else.
+{
+  assert.deepEqual(
+    buildIgnoredMessageEvent('allowlist_mismatch'),
+    { event: 'ignored', reason: 'allowlist_mismatch' },
+    'a policy rejection carries the rule, not the parties',
+  );
+
+  for (const reason of ['allowlist_mismatch', 'allowlist_mismatch_owner_chat', 'self_chat_mode_rejects_non_self']) {
+    assert.deepEqual(Object.keys(buildIgnoredMessageEvent(reason)).sort(), ['event', 'reason']);
+    assert.equal(buildIgnoredMessageEvent(reason).reason, reason);
+  }
+  console.log('  ✓ ignored events carry a fixed policy reason');
+}
+
+// The reason is an allowlist, not a passthrough: it is the only free-ish
+// field on the line, so it must not become the channel that identities take
+// back out. Anything unrecognised degrades to a generic tag.
+{
+  const jid = '15551234567@s.whatsapp.net';
+  for (const hostile of [jid, `allowlist_mismatch ${jid}`, undefined, null, '', 42, {}, ['allowlist_mismatch'],
+                         'allowlist_mismatch\n{"event":"connected"}']) {
+    const event = buildIgnoredMessageEvent(hostile);
+    assert.deepEqual(Object.keys(event).sort(), ['event', 'reason']);
+    assert.equal(event.reason, 'policy', `unrecognised reason ${JSON.stringify(hostile)} must degrade to a generic tag`);
+    assert.ok(!JSON.stringify(event).includes('15551234567'), 'no identity may ride out on the reason');
+    assert.ok(!JSON.stringify(event).includes('@s.whatsapp.net'));
+  }
+  console.log('  ✓ unrecognised reasons degrade to a generic tag');
+}
+
+// Extra arguments cannot widen the line. The call sites sit inside the
+// message loop with `chatId`/`senderId` in scope, so the shape has to be
+// closed against a well-meaning "just add the chat id" edit.
+{
+  const event = buildIgnoredMessageEvent('allowlist_mismatch', {
+    chatId: '15551234567@s.whatsapp.net',
+    senderId: '15559876543@lid',
+  });
+  assert.deepEqual(event, { event: 'ignored', reason: 'allowlist_mismatch' });
+  console.log('  ✓ ignored events cannot be widened by the caller');
 }
 
 console.log('\n✅ All WhatsApp native bridge helper tests passed.');

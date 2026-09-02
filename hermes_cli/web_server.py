@@ -8737,7 +8737,29 @@ def _write_platform_enabled(platform_id: str, enabled: bool) -> None:
 
 
 _WHATSAPP_ONBOARDING_TTL_SECONDS = 600
-_WHATSAPP_ONBOARDING_TERMINAL_STATUSES = {"connected", "error", "expired", "cancelled"}
+#: ``repair_required`` is terminal, and deliberately distinct from ``error``.
+#: The child stopped on purpose rather than sending pairing material over this
+#: stream, and the operator has exactly one action to take. Leaving it out let
+#: finalization overwrite it with the generic failure, which discarded the only
+#: actionable instruction and left the dashboard polling a run that had ended.
+_WHATSAPP_ONBOARDING_TERMINAL_STATUSES = {
+    "connected",
+    "error",
+    "expired",
+    "cancelled",
+    "repair_required",
+}
+_WHATSAPP_PAIRING_FAILED_MESSAGE = "WhatsApp pairing failed."
+#: Fixed generic state for any pairing that would need a QR. The dashboard
+#: cannot display one by design: the payload must stay in the operator's own
+#: local terminal, so it is never sent over the pairing stream, stored, or
+#: re-served here. The remedy is the supported one-shot local command.
+_WHATSAPP_REPAIR_REQUIRED_MESSAGE = (
+    "WhatsApp needs to be paired again. Run 'hermes whatsapp' in a local terminal."
+)
+_WHATSAPP_PAIRING_START_FAILED_MESSAGE = "WhatsApp pairing could not be started."
+_WHATSAPP_RESET_CONFIRMATION_DETAIL = "WhatsApp session reset requires confirmation."
+_WHATSAPP_PAIRING_FINALIZATION_DELAY_SECONDS = 0.1
 
 
 @dataclass
@@ -8755,6 +8777,8 @@ class _WhatsAppOnboardingSession:
     account_name: str | None = None
     account_phone: str | None = None
     error: str | None = None
+    recovery_lease: Any = None
+    connected_event_received: bool = False
 
 
 _whatsapp_onboarding_sessions: dict[str, _WhatsAppOnboardingSession] = {}
@@ -8779,26 +8803,122 @@ def _normalize_whatsapp_allowed_users(value: Any) -> str:
     return ",".join(part.replace(" ", "") for part in raw.split(",") if part.strip())
 
 
+_WHATSAPP_CREDENTIAL_MAX_BYTES = 1024 * 1024
+
+
+def _read_bounded_whatsapp_credentials(
+    session_path: Path,
+) -> tuple[Literal["absent", "invalid", "complete"], dict[str, Any] | None]:
+    """Classify local credentials without following or blocking on file types."""
+    path = session_path / "creds.json"
+    try:
+        before = os.lstat(path)
+    except FileNotFoundError:
+        return "absent", None
+    except (OSError, ValueError):
+        return "invalid", None
+    if not stat.S_ISREG(before.st_mode):
+        return "invalid", None
+    if before.st_size <= 0 or before.st_size > _WHATSAPP_CREDENTIAL_MAX_BYTES:
+        return "invalid", None
+
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    fd: int | None = None
+    try:
+        fd = os.open(path, flags)
+        opened = os.fstat(fd)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_dev != before.st_dev
+            or opened.st_ino != before.st_ino
+            or opened.st_size <= 0
+            or opened.st_size > _WHATSAPP_CREDENTIAL_MAX_BYTES
+        ):
+            return "invalid", None
+
+        chunks: list[bytes] = []
+        total = 0
+        while total <= _WHATSAPP_CREDENTIAL_MAX_BYTES:
+            chunk = os.read(
+                fd,
+                min(64 * 1024, _WHATSAPP_CREDENTIAL_MAX_BYTES + 1 - total),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total == 0 or total > _WHATSAPP_CREDENTIAL_MAX_BYTES:
+            return "invalid", None
+
+        after = os.fstat(fd)
+        if (
+            after.st_dev != opened.st_dev
+            or after.st_ino != opened.st_ino
+            or after.st_size != opened.st_size
+            or after.st_mtime_ns != opened.st_mtime_ns
+        ):
+            return "invalid", None
+        payload = json.loads(b"".join(chunks).decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        return "invalid", None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    if not isinstance(payload, dict):
+        return "invalid", None
+    me = payload.get("me")
+    if not isinstance(me, dict):
+        return "invalid", None
+    account_id = me.get("id")
+    if not isinstance(account_id, str) or not account_id.strip():
+        return "invalid", None
+    return "complete", payload
+
+
 def _whatsapp_session_path() -> Path:
     from hermes_constants import get_hermes_dir
 
     return get_hermes_dir("platforms/whatsapp/session", "whatsapp/session")
 
 
-def _whatsapp_phone_from_identifier(value: Any) -> str | None:
-    raw = str(value or "").strip()
+def _normalize_whatsapp_account_id(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    raw = value.strip()
     if not raw:
         return None
     candidate = raw.split("@", 1)[0].split(":", 1)[0]
-    digits = re.sub(r"\D+", "", candidate)
-    return digits or None
+    digits = "".join(char for char in candidate if char.isdigit())
+    return digits[:32] or None
+
+
+def _whatsapp_phone_from_identifier(value: Any) -> str | None:
+    account_id = _normalize_whatsapp_account_id(value)
+    if account_id is None:
+        return None
+    digits = account_id.removeprefix("+")
+    return digits if digits.isdigit() else None
+
+
+def _normalize_whatsapp_account_name(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    if any(separator in value for separator in ("/", "\\", "@")):
+        return None
+    normalized = re.sub(r"\s+", " ", value).strip()[:80]
+    return normalized or None
 
 
 def _whatsapp_linked_account_from_session(session_path: Path) -> tuple[str | None, str | None, str | None]:
-    creds_path = session_path / "creds.json"
-    try:
-        payload = json.loads(creds_path.read_text(encoding="utf-8"))
-    except Exception:
+    state, payload = _read_bounded_whatsapp_credentials(session_path)
+    if state != "complete" or payload is None:
         return None, None, None
 
     account_id: str | None = None
@@ -8810,13 +8930,13 @@ def _whatsapp_linked_account_from_session(session_path: Path) -> tuple[str | Non
             return
         if account_id is None:
             for key in ("id", "jid", "lid"):
-                value = str(candidate.get(key) or "").strip()
+                value = _normalize_whatsapp_account_id(candidate.get(key))
                 if value:
                     account_id = value
                     break
         if account_name is None:
             for key in ("name", "verifiedName", "notify", "pushName"):
-                value = str(candidate.get(key) or "").strip()
+                value = _normalize_whatsapp_account_name(candidate.get(key))
                 if value:
                     account_name = value
                     break
@@ -8829,7 +8949,12 @@ def _whatsapp_linked_account_from_session(session_path: Path) -> tuple[str | Non
 
 def _ensure_whatsapp_bridge_dependencies(bridge_dir: Path) -> None:
     """Install bridge dependencies when the dashboard is the setup surface."""
-    if (bridge_dir / "node_modules").exists():
+    from gateway.platforms.whatsapp_common import (
+        whatsapp_bridge_dependencies_fresh,
+        write_whatsapp_bridge_dependency_stamp,
+    )
+
+    if whatsapp_bridge_dependencies_fresh(bridge_dir):
         return
 
     from hermes_constants import find_node_executable, with_hermes_node_path
@@ -8865,20 +8990,25 @@ def _ensure_whatsapp_bridge_dependencies(bridge_dir: Path) -> None:
     except OSError as exc:
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to install WhatsApp bridge dependencies: {exc}",
+            detail="WhatsApp bridge dependencies could not be installed.",
         ) from exc
 
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
-        if detail:
-            detail = "\n".join(detail.splitlines()[-10:])
         raise HTTPException(
             status_code=500,
-            detail=f"npm install failed for WhatsApp bridge: {detail or 'no output'}",
+            detail="WhatsApp bridge dependencies could not be installed.",
         )
+    try:
+        write_whatsapp_bridge_dependency_stamp(bridge_dir)
+    except OSError:
+        pass
 
 
-def _spawn_whatsapp_pairing_process(session_path: Path, mode: str) -> subprocess.Popen:
+def _spawn_whatsapp_pairing_process(
+    session_path: Path,
+    mode: str,
+    recovery_lease: Any,
+) -> subprocess.Popen:
     from gateway.platforms.whatsapp_common import resolve_whatsapp_bridge_dir
     from hermes_constants import find_node_executable, with_hermes_node_path
 
@@ -8887,7 +9017,7 @@ def _spawn_whatsapp_pairing_process(session_path: Path, mode: str) -> subprocess
     if not bridge_script.exists():
         raise HTTPException(
             status_code=500,
-            detail=f"WhatsApp bridge script was not found at {bridge_script}.",
+            detail="WhatsApp bridge script was not found.",
         )
     node = find_node_executable("node")
     if not node:
@@ -8910,6 +9040,8 @@ def _spawn_whatsapp_pairing_process(session_path: Path, mode: str) -> subprocess
             "--pair-json",
             "--session",
             str(session_path),
+            "--port",
+            "3000",
         ],
         cwd=str(bridge_dir),
         stdout=subprocess.PIPE,
@@ -8920,6 +9052,7 @@ def _spawn_whatsapp_pairing_process(session_path: Path, mode: str) -> subprocess
         start_new_session=True,
         env=env,
         creationflags=windows_hide_flags(),
+        **recovery_lease.pair_subprocess_kwargs(),
     )
 
 
@@ -8939,6 +9072,7 @@ def _terminate_whatsapp_pairing(proc: subprocess.Popen | None) -> None:
 
 
 def _watch_whatsapp_pairing(pairing_id: str, proc: subprocess.Popen) -> None:
+    """Consume child events and publish only a verified final connection."""
     try:
         stream = proc.stdout
         if stream is not None:
@@ -8954,77 +9088,188 @@ def _watch_whatsapp_pairing(pairing_id: str, proc: subprocess.Popen) -> None:
                 with _whatsapp_onboarding_lock:
                     record = _whatsapp_onboarding_sessions.get(pairing_id)
                     if not record or record.proc is not proc:
-                        return
-                    if event == "qr":
-                        qr = str(payload.get("qr") or "").strip()
-                        if qr:
-                            record.qr_payload = qr
-                            record.status = "waiting"
-                            record.error = None
+                        continue
+                    if event in {"qr", "repair_required"}:
+                        # Pairing material never leaves the operator's own
+                        # terminal. The bridge no longer sends a QR over this
+                        # stream, and a stale/hostile child that does must not
+                        # have it stored or re-served: the dashboard reports
+                        # generic re-pair-required state and nothing else.
+                        record.qr_payload = None
+                        record.status = "repair_required"
+                        record.error = _WHATSAPP_REPAIR_REQUIRED_MESSAGE
                     elif event == "connected":
-                        user = payload.get("user")
-                        if isinstance(user, dict):
-                            account_id = str(user.get("id") or "").strip()
-                            account_name = str(user.get("name") or "").strip()
-                            record.account_id = account_id or None
-                            record.account_name = account_name or None
-                            record.account_phone = _whatsapp_phone_from_identifier(account_id)
-                        record.status = "connected"
+                        # Child output is advisory. A zero exit, complete local
+                        # credentials, and an absent canonical marker are still
+                        # required while the recovery lease remains held.
+                        record.connected_event_received = True
+                        if record.status == "starting":
+                            record.status = "waiting"
                         record.error = None
                     elif event == "error":
                         record.status = "error"
-                        record.error = str(payload.get("error") or "WhatsApp pairing failed.")
+                        record.error = _WHATSAPP_PAIRING_FAILED_MESSAGE
                     elif event == "disconnected" and record.status == "starting":
                         record.status = "waiting"
         returncode = proc.wait()
     except Exception as exc:
+        _log.error(
+            "WhatsApp pairing watcher failed (%s).",
+            type(exc).__name__,
+        )
+        _terminate_whatsapp_pairing(proc)
         with _whatsapp_onboarding_lock:
             record = _whatsapp_onboarding_sessions.get(pairing_id)
-            if record and record.proc is proc and record.status not in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES:
+            if (
+                record
+                and record.proc is proc
+                and record.status not in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES
+            ):
                 record.status = "error"
-                record.error = str(exc)
+                record.error = _WHATSAPP_PAIRING_FAILED_MESSAGE
         return
 
     with _whatsapp_onboarding_lock:
         record = _whatsapp_onboarding_sessions.get(pairing_id)
         if not record or record.proc is not proc:
             return
-        if record.status in {"connected", "cancelled", "expired"}:
+        if record.status in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES:
+            return
+        connected_event_received = record.connected_event_received
+        session_path = Path(record.session_path)
+
+    credentials_state: Literal["absent", "invalid", "complete"] = "invalid"
+    marker_absent = False
+    if returncode == 0 and connected_event_received:
+        if _WHATSAPP_PAIRING_FINALIZATION_DELAY_SECONDS > 0:
+            time.sleep(_WHATSAPP_PAIRING_FINALIZATION_DELAY_SECONDS)
+        credentials_state, _payload = _read_bounded_whatsapp_credentials(session_path)
+        try:
+            from gateway.platforms.whatsapp_common import is_whatsapp_session_revoked
+
+            marker_absent = not is_whatsapp_session_revoked(session_path)
+        except Exception:
+            marker_absent = False
+
+    with _whatsapp_onboarding_lock:
+        record = _whatsapp_onboarding_sessions.get(pairing_id)
+        if not record or record.proc is not proc:
+            return
+        if record.status in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES:
+            return
+        if credentials_state == "complete" and marker_absent:
+            (
+                record.account_id,
+                record.account_name,
+                record.account_phone,
+            ) = _whatsapp_linked_account_from_session(session_path)
+            record.status = "connected"
+            record.error = None
             return
         record.status = "error"
-        record.error = (
-            "WhatsApp pairing process exited before pairing completed."
-            if returncode == 0
-            else f"WhatsApp pairing process exited with code {returncode}."
+        record.error = _WHATSAPP_PAIRING_FAILED_MESSAGE
+
+
+def _release_whatsapp_recovery_lease(recovery_lease: Any) -> None:
+    try:
+        recovery_lease.release()
+    except Exception as exc:
+        _log.error(
+            "WhatsApp recovery lease could not be released (%s).",
+            type(exc).__name__,
         )
 
 
-def _run_whatsapp_pairing(pairing_id: str, session_path: Path, mode: str) -> None:
-    with _whatsapp_onboarding_lock:
-        record = _whatsapp_onboarding_sessions.get(pairing_id)
-        if not record or record.status in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES:
-            return
-        record.status = "installing"
-
+def _run_whatsapp_pairing(
+    pairing_id: str, session_path: Path, mode: str, recovery_lease: Any
+) -> None:
     try:
-        proc = _spawn_whatsapp_pairing_process(session_path, mode)
-    except Exception as exc:
         with _whatsapp_onboarding_lock:
             record = _whatsapp_onboarding_sessions.get(pairing_id)
-            if record and record.status not in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES:
-                record.status = "error"
-                record.error = str(exc)
-        return
+            if not record or record.status in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES:
+                return
+            record.status = "installing"
 
-    with _whatsapp_onboarding_lock:
-        record = _whatsapp_onboarding_sessions.get(pairing_id)
-        if not record or record.status in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES:
-            _terminate_whatsapp_pairing(proc)
+        try:
+            proc = _spawn_whatsapp_pairing_process(
+                session_path,
+                mode,
+                recovery_lease,
+            )
+        except Exception as exc:
+            _log.error(
+                "WhatsApp pairing process could not be started (%s).",
+                type(exc).__name__,
+            )
+            with _whatsapp_onboarding_lock:
+                record = _whatsapp_onboarding_sessions.get(pairing_id)
+                if record and record.status not in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES:
+                    record.status = "error"
+                    record.error = _WHATSAPP_PAIRING_START_FAILED_MESSAGE
             return
-        record.proc = proc
-        record.status = "starting"
 
-    _watch_whatsapp_pairing(pairing_id, proc)
+        with _whatsapp_onboarding_lock:
+            record = _whatsapp_onboarding_sessions.get(pairing_id)
+            if not record or record.status in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES:
+                _terminate_whatsapp_pairing(proc)
+                return
+            record.proc = proc
+            record.status = "starting"
+
+        _watch_whatsapp_pairing(pairing_id, proc)
+    finally:
+        _release_whatsapp_recovery_lease(recovery_lease)
+        with _whatsapp_onboarding_lock:
+            record = _whatsapp_onboarding_sessions.get(pairing_id)
+            if record and record.recovery_lease is recovery_lease:
+                record.recovery_lease = None
+
+
+def _begin_whatsapp_pairing_background(
+    session_path: Path,
+    mode: str,
+    allowed_users: str,
+    expires_at: str,
+    expires_at_ts: float,
+    profile: Optional[str],
+    recovery_lease: Any,
+) -> dict[str, Any]:
+    """Hand a recovery lease to one background pairing watcher."""
+    pairing_id = secrets.token_urlsafe(16)
+    record = _WhatsAppOnboardingSession(
+        proc=None,
+        mode=mode,
+        allowed_users=allowed_users,
+        session_path=str(session_path),
+        expires_at=expires_at,
+        expires_at_ts=expires_at_ts,
+        profile=profile,
+        recovery_lease=recovery_lease,
+    )
+    try:
+        with _whatsapp_onboarding_lock:
+            _prune_whatsapp_onboarding_sessions()
+            _supersede_whatsapp_onboarding_sessions(session_path)
+            _whatsapp_onboarding_sessions[pairing_id] = record
+
+        payload = _whatsapp_onboarding_payload(pairing_id, record)
+        threading.Thread(
+            target=_run_whatsapp_pairing,
+            args=(pairing_id, session_path, mode, recovery_lease),
+            daemon=True,
+        ).start()
+    except BaseException as exc:
+        with _whatsapp_onboarding_lock:
+            if _whatsapp_onboarding_sessions.get(pairing_id) is record:
+                _whatsapp_onboarding_sessions.pop(pairing_id, None)
+        _release_whatsapp_recovery_lease(recovery_lease)
+        if isinstance(exc, Exception):
+            raise HTTPException(
+                status_code=500,
+                detail="WhatsApp pairing could not be started.",
+            ) from exc
+        raise
+    return payload
 
 
 def _prune_whatsapp_onboarding_sessions() -> None:
@@ -9032,12 +9277,13 @@ def _prune_whatsapp_onboarding_sessions() -> None:
     remove_ids: list[str] = []
     for pairing_id, record in _whatsapp_onboarding_sessions.items():
         if (
-            record.proc is not None
+            record.recovery_lease is None
+            and record.proc is not None
             and record.status not in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES
             and record.proc.poll() is not None
         ):
             record.status = "error"
-            record.error = "WhatsApp pairing process exited before pairing completed."
+            record.error = _WHATSAPP_PAIRING_FAILED_MESSAGE
         if record.expires_at_ts <= now and record.status not in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES:
             _terminate_whatsapp_pairing(record.proc)
             record.status = "expired"
@@ -9063,7 +9309,6 @@ def _whatsapp_onboarding_payload(pairing_id: str, record: _WhatsAppOnboardingSes
         "qr_payload": record.qr_payload,
         "expires_at": record.expires_at,
         "mode": record.mode,
-        "allowed_users": record.allowed_users,
         "account_id": record.account_id,
         "account_name": record.account_name,
         "account_phone": record.account_phone,
@@ -9075,16 +9320,16 @@ def _restart_gateway_after_whatsapp_onboarding(profile: Optional[str] = None) ->
     try:
         proc, reused = _spawn_gateway_restart(profile)
     except Exception as exc:
-        _log.exception("Failed to auto-restart gateway after WhatsApp onboarding")
+        _log.error(
+            "Failed to auto-restart gateway after WhatsApp onboarding (%s).",
+            type(exc).__name__,
+        )
         return {
             "restart_started": False,
-            "restart_error": str(exc),
+            "restart_error": "Gateway restart could not be started.",
         }
     if reused:
-        _log.info(
-            "WhatsApp onboarding: reusing in-flight gateway restart (pid %s)",
-            proc.pid,
-        )
+        _log.info("WhatsApp onboarding: reusing in-flight gateway restart.")
     return {
         "restart_started": True,
         "restart_action": "gateway-restart",
@@ -9094,15 +9339,51 @@ def _restart_gateway_after_whatsapp_onboarding(profile: Optional[str] = None) ->
 
 @app.post("/api/messaging/whatsapp/onboarding/start")
 async def start_whatsapp_onboarding(body: WhatsAppOnboardingStart):
+    # Imported here, and from whatsapp_common rather than the WhatsApp
+    # adapter: the dashboard must not drag the adapter (and its Baileys
+    # bridge machinery) into its import graph just to read one marker file.
+    from gateway.platforms.whatsapp_common import (
+        is_whatsapp_session_revoked,
+        resolve_whatsapp_bridge_dir,
+    )
+    from gateway.platforms.whatsapp_recovery import (
+        WhatsAppRecoveryError,
+        acquire_whatsapp_recovery_lease,
+    )
+
     mode = _normalize_whatsapp_onboarding_mode(body.mode)
     allowed_users = _normalize_whatsapp_allowed_users(body.allowed_users)
     effective_profile = body.profile
+    recovery_lease = None
 
     with _config_profile_scope(effective_profile):
         session_path = _whatsapp_session_path()
         expires_at_ts = time.time() + _WHATSAPP_ONBOARDING_TTL_SECONDS
         expires_at = _utc_iso_from_ts(expires_at_ts)
-        if (session_path / "creds.json").exists():
+        # Marker presence fails closed, including malformed or unreadable
+        # markers, but the first Pair request is only a read-only probe. The
+        # browser must retry with explicit reset authorization before this
+        # endpoint may quiesce a bridge, terminate a pairing, or delete auth.
+        try:
+            session_is_revoked = is_whatsapp_session_revoked(session_path)
+        except Exception:
+            # The shared helper treats every marker read failure as revoked.
+            # Keep that contract if an unexpected decoder/runtime failure
+            # escapes it, without reflecting exception-controlled text.
+            session_is_revoked = True
+
+        credentials_state, _credentials = _read_bounded_whatsapp_credentials(
+            session_path
+        )
+        reset_required = session_is_revoked or credentials_state == "invalid"
+
+        if reset_required and not body.reset_revoked_session:
+            raise HTTPException(
+                status_code=409,
+                detail=_WHATSAPP_RESET_CONFIRMATION_DETAIL,
+            )
+
+        if credentials_state == "complete" and not session_is_revoked:
             pairing_id = secrets.token_urlsafe(16)
             account_id, account_name, account_phone = _whatsapp_linked_account_from_session(session_path)
             record = _WhatsAppOnboardingSession(
@@ -9124,29 +9405,64 @@ async def start_whatsapp_onboarding(body: WhatsAppOnboardingStart):
                 _whatsapp_onboarding_sessions[pairing_id] = record
             return _whatsapp_onboarding_payload(pairing_id, record)
 
-    pairing_id = secrets.token_urlsafe(16)
-    record = _WhatsAppOnboardingSession(
-        proc=None,
-        mode=mode,
-        allowed_users=allowed_users,
-        session_path=str(session_path),
-        expires_at=expires_at,
-        expires_at_ts=expires_at_ts,
-        profile=effective_profile,
-    )
+        bridge_script = resolve_whatsapp_bridge_dir() / "bridge.js"
+        try:
+            recovery_lease = acquire_whatsapp_recovery_lease(
+                session_path,
+                bridge_port=3000,
+                bridge_script=bridge_script,
+            )
+        except WhatsAppRecoveryError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "The WhatsApp session is still in use, so pairing was not "
+                    "started. Stop the active bridge and try again."
+                ),
+            ) from exc
 
-    with _whatsapp_onboarding_lock:
-        _prune_whatsapp_onboarding_sessions()
-        _supersede_whatsapp_onboarding_sessions(session_path)
-        _whatsapp_onboarding_sessions[pairing_id] = record
-
-    threading.Thread(
-        target=_run_whatsapp_pairing,
-        args=(pairing_id, session_path, mode),
-        daemon=True,
-    ).start()
-
-    return _whatsapp_onboarding_payload(pairing_id, record)
+        if reset_required:
+            _log.warning(
+                "WhatsApp onboarding: the stored session requires reset; "
+                "clearing it after explicit authorization."
+            )
+            try:
+                save_env_value("WHATSAPP_ENABLED", "false")
+                _write_platform_enabled("whatsapp", False)
+            except Exception as exc:
+                _log.error(
+                    "WhatsApp onboarding: could not persist disabled state (%s).",
+                    type(exc).__name__,
+                )
+                _release_whatsapp_recovery_lease(recovery_lease)
+                raise HTTPException(
+                    status_code=500,
+                    detail="WhatsApp could not be disabled, so pairing was not started.",
+                ) from exc
+            try:
+                recovery_lease.reset_session(session_path)
+            except Exception as exc:
+                # Falling through would pair on top of auth state that still
+                # exists. Log only the exception class; paths and auth values
+                # are deliberately excluded from this dashboard boundary.
+                _log.error(
+                    "WhatsApp onboarding: could not reset the stored session (%s).",
+                    type(exc).__name__,
+                )
+                _release_whatsapp_recovery_lease(recovery_lease)
+                raise HTTPException(
+                    status_code=500,
+                    detail="The WhatsApp session could not be reset, so pairing was not started.",
+                ) from exc
+        return _begin_whatsapp_pairing_background(
+            session_path,
+            mode,
+            allowed_users,
+            expires_at,
+            expires_at_ts,
+            effective_profile,
+            recovery_lease,
+        )
 
 
 @app.get("/api/messaging/whatsapp/onboarding/{pairing_id}")
@@ -9178,17 +9494,40 @@ async def apply_whatsapp_onboarding(
             )
         if record.status != "connected":
             raise HTTPException(status_code=409, detail="WhatsApp setup is not connected yet.")
-        mode = _normalize_whatsapp_onboarding_mode(body.mode or record.mode)
-        allowed_users = _normalize_whatsapp_allowed_users(
-            record.allowed_users if body.allowed_users is None else body.allowed_users
-        )
+        # The start request is the authority captured by this opaque pairing
+        # record. Apply never trusts client-echoed mode, allowlist, or profile.
+        mode = _normalize_whatsapp_onboarding_mode(record.mode)
+        allowed_users = _normalize_whatsapp_allowed_users(record.allowed_users)
         if mode == "self-chat" and not allowed_users:
             allowed_users = record.account_phone or record.account_id or ""
         record_profile = record.profile
+        session_path = Path(record.session_path)
 
-    effective_profile = body.profile or profile or record_profile
+    effective_profile = record_profile
     try:
         with _config_profile_scope(effective_profile):
+            credentials_state, _credentials = _read_bounded_whatsapp_credentials(
+                session_path
+            )
+            try:
+                from gateway.platforms.whatsapp_common import (
+                    is_whatsapp_session_revoked,
+                )
+
+                marker_absent = not is_whatsapp_session_revoked(session_path)
+            except Exception:
+                marker_absent = False
+            if credentials_state != "complete" or not marker_absent:
+                with _whatsapp_onboarding_lock:
+                    current = _whatsapp_onboarding_sessions.get(pairing_id)
+                    if current is not None and current is record:
+                        current.status = "error"
+                        current.error = _WHATSAPP_PAIRING_FAILED_MESSAGE
+                raise HTTPException(
+                    status_code=409,
+                    detail="WhatsApp setup is no longer valid. Start a new setup.",
+                )
+
             save_env_value("WHATSAPP_MODE", mode)
             save_env_value("WHATSAPP_DM_POLICY", "pairing")
             if allowed_users:
@@ -9200,9 +9539,19 @@ async def apply_whatsapp_onboarding(
     except HTTPException:
         raise
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _log.error(
+            "WhatsApp onboarding apply values were rejected (%s).",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="WhatsApp setup values are invalid.",
+        ) from exc
     except Exception as exc:
-        _log.exception("WhatsApp onboarding apply failed")
+        _log.error(
+            "WhatsApp onboarding apply failed (%s).",
+            type(exc).__name__,
+        )
         raise HTTPException(
             status_code=500,
             detail="Failed to save WhatsApp setup.",

@@ -908,10 +908,7 @@ export const api = {
       `/api/messaging/telegram/onboarding/${encodeURIComponent(pairingId)}`,
       { method: "DELETE" },
     ),
-  startWhatsAppOnboarding: (body: {
-    mode?: "bot" | "self-chat";
-    allowed_users?: string;
-  }) =>
+  startWhatsAppOnboarding: (body: WhatsAppOnboardingStartRequest) =>
     fetchJSON<WhatsAppOnboardingStartResponse>(
       "/api/messaging/whatsapp/onboarding/start",
       {
@@ -2004,16 +2001,40 @@ export interface WhatsAppOnboardingStartResponse {
     | "waiting"
     | "connected"
     | "error"
+    // Terminal and deliberately distinct from "error": the session needs
+    // re-pairing, and the QR can only be shown by the local `hermes whatsapp`
+    // command. The dashboard never receives a pairing payload for this state.
+    | "repair_required"
     | "expired"
     | "cancelled";
   qr_payload?: string | null;
   expires_at: string;
   mode: "bot" | "self-chat";
-  allowed_users: string;
   account_id?: string | null;
   account_name?: string | null;
   account_phone?: string | null;
   error?: string | null;
+}
+
+export interface WhatsAppOnboardingStartRequest {
+  mode?: "bot" | "self-chat";
+  allowed_users?: string;
+  reset_revoked_session?: boolean;
+}
+
+const WHATSAPP_RESET_CONFIRMATION_REQUIRED_DETAIL =
+  "WhatsApp session reset requires confirmation.";
+
+export function isWhatsAppResetConfirmationRequired(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  const match = /^409:\s*(.*)$/.exec(message);
+  if (!match) return false;
+  try {
+    const body = JSON.parse(match[1]) as { detail?: unknown };
+    return body.detail === WHATSAPP_RESET_CONFIRMATION_REQUIRED_DETAIL;
+  } catch {
+    return false;
+  }
 }
 
 export type WhatsAppOnboardingStatusResponse = WhatsAppOnboardingStartResponse;

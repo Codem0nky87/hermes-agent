@@ -77,6 +77,32 @@ jobs:
           process.stdout.write("checks=" + JSON.stringify(checks) + "\n");
           ' >> "$GITHUB_OUTPUT"
 
+  # The WhatsApp bridge is a standalone npm package, not an npm workspace: it
+  # ships to the user's machine and installs its own dependencies there, so it
+  # keeps its own package.json + lockfile. That also means the workspace
+  # discovery job above cannot see it (``npm query .workspace`` never returns
+  # it), which is why it needs a job of its own rather than a matrix entry.
+  whatsapp-bridge:
+    name: scripts/whatsapp-bridge / check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: scripts/whatsapp-bridge
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 26
+          cache: npm
+          cache-dependency-path: scripts/whatsapp-bridge/package-lock.json
+
+      # --ignore-scripts: nothing in this tree needs a postinstall, and the
+      # bridge talks to a third-party network service, so its dependency
+      # install is not given arbitrary code execution on the runner.
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run check
+
   check:
     name: ${{ matrix.package }} / ${{ matrix.script }}
     needs: workspaces

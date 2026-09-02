@@ -31,11 +31,15 @@ defined on the mixin and may be overridden per-adapter if needed.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
-from typing import Any, Dict, Optional
+import secrets
+import stat
+from pathlib import Path
+from typing import Any, Dict, Iterable, Optional
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
@@ -500,8 +504,630 @@ class WhatsAppBehaviorMixin:
 
 
 # ---------------------------------------------------------------------------
+# Revoked-session marker — shared by the adapter, the CLI and the dashboard
+# ---------------------------------------------------------------------------
+
+#: Filename the Node bridge writes inside the session directory when WhatsApp
+#: durably revokes the device.
+#:
+#: DOCUMENTED CONTRACT with scripts/whatsapp-bridge/bridge_helpers.js
+#: (``sessionRevokedMarkerPath``).  The bridge writes it atomically, mode
+#: 0600, immediately *before* exiting ``BRIDGE_EXIT_LOGGED_OUT``.  It carries
+#: no auth material — only a bounded status code, two sanitised reason tags
+#: and a timestamp.
+#:
+#: It lives *inside* the session directory so that re-pairing — which removes
+#: that directory wholesale — clears it without a separate cleanup step the
+#: control paths could forget.
+WHATSAPP_REVOKED_MARKER_NAME = "revoked.json"
+
+
+def is_whatsapp_session_revoked(session_dir: Path) -> bool:
+    """Return whether the revocation marker directory entry is present.
+
+    Marker contents are deliberately irrelevant: the Node bridge writes the
+    entry only for a terminal revocation, and reset removes the whole session.
+    ``lstat`` observes a symlink, FIFO, device, directory, or invalid-byte file
+    without opening it, so hostile local state cannot block this preflight.
+    Only a genuine ``FileNotFoundError`` means there is no marker; every other
+    result or inspection failure remains terminal and fails closed.
+    """
+    marker = Path(session_dir) / WHATSAPP_REVOKED_MARKER_NAME
+    try:
+        marker.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+class WhatsAppSessionStateError(RuntimeError):
+    """Local WhatsApp session state is missing, hostile, or unsafely owned.
+
+    Carries a fixed message only: the underlying ``OSError`` stringifies to an
+    absolute path that discloses the operator's home directory and username.
+    """
+
+
+def ensure_whatsapp_session_dir(session_dir: Path) -> Path:
+    """Create/verify the paired-session directory as owner-only, exactly 0700.
+
+    The directory holds Baileys credentials, so group/other access is never
+    acceptable. ``mkdir(parents=True)`` alone creates at ``0777 & ~umask``
+    (normally ``0755``), and ``exist_ok=True`` silently accepts a directory an
+    earlier run — or another user — left readable, so both the creation mode
+    and the resulting mode are enforced here.
+
+    Errors are fixed strings: an ``OSError`` stringifies to a path that
+    discloses the operator's home directory and username.
+    """
+    session_dir = Path(session_dir)
+    try:
+        session_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError as exc:
+        raise WhatsAppSessionStateError(
+            "The WhatsApp session directory could not be created."
+        ) from exc
+
+    try:
+        entry_stat = os.lstat(session_dir)
+    except OSError as exc:
+        raise WhatsAppSessionStateError(
+            "The WhatsApp session directory could not be inspected."
+        ) from exc
+
+    # Refuse a symlinked or non-directory session path outright.
+    if not stat.S_ISDIR(entry_stat.st_mode):
+        raise WhatsAppSessionStateError(
+            "The WhatsApp session directory is not a directory."
+        )
+
+    # Everything from here runs against a no-follow descriptor rather than the
+    # path. A path-based os.chmod resolves the name again at call time, so an
+    # entry swapped for a symlink after the lstat above would have had its
+    # *target* re-permissioned before any check could reject the swap — the
+    # rejection would arrive too late to matter.
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        dir_fd = os.open(session_dir, directory_flags)
+    except OSError as exc:
+        raise WhatsAppSessionStateError(
+            "The WhatsApp session directory could not be opened safely."
+        ) from exc
+
+    try:
+        opened_stat = os.fstat(dir_fd)
+        if not stat.S_ISDIR(opened_stat.st_mode):
+            raise WhatsAppSessionStateError(
+                "The WhatsApp session directory is not a directory."
+            )
+        # The entry inspected must be the entry opened.
+        if (opened_stat.st_dev, opened_stat.st_ino) != (
+            entry_stat.st_dev,
+            entry_stat.st_ino,
+        ):
+            raise WhatsAppSessionStateError(
+                "The WhatsApp session directory changed while it was opened."
+            )
+        if hasattr(os, "getuid") and opened_stat.st_uid != os.getuid():
+            raise WhatsAppSessionStateError(
+                "The WhatsApp session directory has the wrong owner."
+            )
+
+        # `mode=` is masked by umask on creation and ignored entirely when the
+        # directory already existed, so tighten through the descriptor and
+        # re-verify through the descriptor.
+        if stat.S_IMODE(opened_stat.st_mode) != 0o700:
+            try:
+                os.fchmod(dir_fd, 0o700)
+            except OSError as exc:
+                raise WhatsAppSessionStateError(
+                    "The WhatsApp session directory permissions could not be set."
+                ) from exc
+            if stat.S_IMODE(os.fstat(dir_fd).st_mode) != 0o700:
+                raise WhatsAppSessionStateError(
+                    "The WhatsApp session directory has unsafe permissions."
+                )
+    finally:
+        try:
+            os.close(dir_fd)
+        except OSError:
+            pass
+    return session_dir
+
+
+def reset_whatsapp_session_dir(session_dir: Path) -> None:
+    """Fail closed: pathname-only destructive reset is no longer authorised.
+
+    This legacy symbol remains importable so an older caller gets a fixed,
+    non-destructive failure rather than an ``ImportError`` or the former
+    symlink-following ``shutil.rmtree`` behavior. Destructive recovery must be
+    performed by the active lease that captured and locked the canonical
+    directory identity::
+
+        lease.reset_session(session_dir)
+
+    See :meth:`gateway.platforms.whatsapp_recovery.WhatsAppRecoveryLease.reset_session`.
+    """
+    del session_dir
+    raise RuntimeError(
+        "WhatsApp session reset requires an active WhatsApp recovery lease."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Shared bridge directory resolution for CLI and adapter
 # ---------------------------------------------------------------------------
+
+_WHATSAPP_BRIDGE_DEPENDENCY_STAMP = ".hermes-pkg-hash"
+_WHATSAPP_BRIDGE_DEPENDENCY_INPUTS = ("package.json", "package-lock.json")
+WHATSAPP_BRIDGE_RUNTIME_INPUTS = (
+    "allowlist.js",
+    "baileys_logger.js",
+    "bridge.js",
+    "bridge_helpers.js",
+    "connection_close.js",
+    "outbound_ids.js",
+    "owner_message_gate.js",
+    "package.json",
+    "package-lock.json",
+)
+_WHATSAPP_BRIDGE_MISSING_SENTINEL = b"HERMES-BRIDGE-MISSING-v1"
+_MAX_WHATSAPP_BRIDGE_INPUT_BYTES = 4 * 1024 * 1024
+_MAX_WHATSAPP_BRIDGE_STAMP_BYTES = 128
+
+
+class _WhatsAppBridgeInputMissing(Exception):
+    """A required bridge input was absent at its initial inspection."""
+
+
+class _WhatsAppBridgeInputInvalid(Exception):
+    """A present bridge input was not one stable, bounded regular file."""
+
+
+def _bridge_input_stat_fingerprint(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _read_whatsapp_bridge_input(
+    path: Path, *, limit: int = _MAX_WHATSAPP_BRIDGE_INPUT_BYTES
+) -> bytes:
+    """Read one bounded bridge input without following or blocking on it."""
+    path = Path(path)
+    try:
+        before_open = path.lstat()
+    except FileNotFoundError as exc:
+        raise _WhatsAppBridgeInputMissing from exc
+    except OSError as exc:
+        raise _WhatsAppBridgeInputInvalid from exc
+    if (
+        not stat.S_ISREG(before_open.st_mode)
+        or before_open.st_size < 0
+        or before_open.st_size > limit
+    ):
+        raise _WhatsAppBridgeInputInvalid
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        # ENOENT here is a substitution race, not initial absence.
+        raise _WhatsAppBridgeInputInvalid from exc
+
+    payload = bytearray()
+    read_error: Optional[BaseException] = None
+    try:
+        opened = os.fstat(fd)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _bridge_input_stat_fingerprint(opened)
+            != _bridge_input_stat_fingerprint(before_open)
+        ):
+            raise _WhatsAppBridgeInputInvalid
+        while len(payload) <= limit:
+            chunk = os.read(fd, min(64 * 1024, limit + 1 - len(payload)))
+            if not chunk:
+                break
+            payload.extend(chunk)
+        after_read = os.fstat(fd)
+        if (
+            len(payload) > limit
+            or _bridge_input_stat_fingerprint(after_read)
+            != _bridge_input_stat_fingerprint(opened)
+            or len(payload) != after_read.st_size
+        ):
+            raise _WhatsAppBridgeInputInvalid
+    except (_WhatsAppBridgeInputInvalid, OSError) as exc:
+        read_error = exc
+    try:
+        os.close(fd)
+    except OSError as exc:
+        read_error = read_error or exc
+    if read_error is not None:
+        raise _WhatsAppBridgeInputInvalid from read_error
+    return bytes(payload)
+
+
+def _whatsapp_bridge_input_fingerprint(
+    bridge_dir: Path, filenames: Iterable[str]
+) -> tuple[str, bool]:
+    """Hash sorted ``filename\0bytes\0`` records and report required presence."""
+    bridge_dir = Path(bridge_dir)
+    try:
+        before_root = bridge_dir.lstat()
+    except OSError:
+        return "", False
+    if not stat.S_ISDIR(before_root.st_mode):
+        return "", False
+
+    digest = hashlib.sha256()
+    all_present = True
+    for filename in sorted(set(filenames)):
+        digest.update(filename.encode("utf-8"))
+        digest.update(b"\0")
+        try:
+            payload = _read_whatsapp_bridge_input(bridge_dir / filename)
+        except _WhatsAppBridgeInputMissing:
+            payload = _WHATSAPP_BRIDGE_MISSING_SENTINEL
+            all_present = False
+        except _WhatsAppBridgeInputInvalid:
+            return "", False
+        digest.update(payload)
+        digest.update(b"\0")
+    try:
+        after_root = bridge_dir.lstat()
+    except OSError:
+        return "", False
+    if (
+        not stat.S_ISDIR(after_root.st_mode)
+        or _bridge_input_stat_fingerprint(after_root)
+        != _bridge_input_stat_fingerprint(before_root)
+    ):
+        return "", False
+    return digest.hexdigest(), all_present
+
+
+def whatsapp_bridge_runtime_hash(bridge_dir: Path) -> str:
+    """Return the required composite runtime fingerprint, or ``""``."""
+    fingerprint, all_present = _whatsapp_bridge_input_fingerprint(
+        bridge_dir, WHATSAPP_BRIDGE_RUNTIME_INPUTS
+    )
+    return fingerprint if all_present else ""
+
+
+def whatsapp_bridge_manifest_hash(bridge_dir: Path) -> str:
+    """Return the composite package manifest/lock fingerprint, or ``""``."""
+    fingerprint, all_present = _whatsapp_bridge_input_fingerprint(
+        bridge_dir, _WHATSAPP_BRIDGE_DEPENDENCY_INPUTS
+    )
+    return fingerprint if all_present else ""
+
+
+def whatsapp_bridge_dependencies_fresh(bridge_dir: Path) -> bool:
+    """Return whether installed dependencies match package.json and its lock."""
+    bridge_dir = Path(bridge_dir)
+    manifest_hash = whatsapp_bridge_manifest_hash(bridge_dir)
+    node_modules = bridge_dir / "node_modules"
+    if not manifest_hash:
+        return False
+    try:
+        node_modules_stat = node_modules.lstat()
+        if not stat.S_ISDIR(node_modules_stat.st_mode):
+            return False
+        installed_hash = _read_whatsapp_bridge_input(
+            node_modules / _WHATSAPP_BRIDGE_DEPENDENCY_STAMP,
+            limit=_MAX_WHATSAPP_BRIDGE_STAMP_BYTES,
+        ).decode("ascii").strip()
+        node_modules_after = node_modules.lstat()
+    except (
+        OSError,
+        UnicodeError,
+        _WhatsAppBridgeInputMissing,
+        _WhatsAppBridgeInputInvalid,
+    ):
+        return False
+    if (
+        not stat.S_ISDIR(node_modules_after.st_mode)
+        or _bridge_input_stat_fingerprint(node_modules_after)
+        != _bridge_input_stat_fingerprint(node_modules_stat)
+    ):
+        return False
+    return installed_hash == manifest_hash
+
+
+def _open_whatsapp_bridge_directory(path: Path) -> tuple[int, os.stat_result]:
+    """Open one real directory without following its final path component."""
+    try:
+        before_open = Path(path).lstat()
+        if not stat.S_ISDIR(before_open.st_mode):
+            raise OSError
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        fd = os.open(path, flags)
+        opened = os.fstat(fd)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_dev != before_open.st_dev
+            or opened.st_ino != before_open.st_ino
+            or opened.st_mode != before_open.st_mode
+        ):
+            os.close(fd)
+            raise OSError
+        return fd, opened
+    except OSError as exc:
+        raise OSError("WhatsApp bridge directory is unavailable.") from exc
+
+
+def _whatsapp_bridge_directory_is_writable(path: Path) -> bool:
+    """Probe directory writes without following or replacing an existing entry."""
+    directory_fd: Optional[int] = None
+    probe_fd: Optional[int] = None
+    probe_name = f".write-test-{secrets.token_hex(12)}"
+    try:
+        directory_fd, _ = _open_whatsapp_bridge_directory(path)
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        probe_fd = os.open(probe_name, flags, 0o600, dir_fd=directory_fd)
+        os.close(probe_fd)
+        probe_fd = None
+        os.unlink(probe_name, dir_fd=directory_fd)
+        probe_name = ""
+        return True
+    except OSError:
+        return False
+    finally:
+        if probe_fd is not None:
+            try:
+                os.close(probe_fd)
+            except OSError:
+                pass
+        if directory_fd is not None:
+            if probe_name:
+                try:
+                    os.unlink(probe_name, dir_fd=directory_fd)
+                except OSError:
+                    pass
+            try:
+                os.close(directory_fd)
+            except OSError:
+                pass
+
+
+def _atomic_write_whatsapp_bridge_file(
+    directory_fd: int, filename: str, payload: bytes
+) -> None:
+    """Atomically replace one flat allowlisted file through a locked root fd."""
+    temporary = f".{filename}.{secrets.token_hex(12)}.tmp"
+    output_fd: Optional[int] = None
+    try:
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        output_fd = os.open(temporary, flags, 0o600, dir_fd=directory_fd)
+        view = memoryview(payload)
+        written = 0
+        while written < len(view):
+            count = os.write(output_fd, view[written:])
+            if count <= 0:
+                raise OSError
+            written += count
+        os.fsync(output_fd)
+        os.close(output_fd)
+        output_fd = None
+        os.replace(
+            temporary,
+            filename,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        temporary = ""
+    finally:
+        if output_fd is not None:
+            try:
+                os.close(output_fd)
+            except OSError:
+                pass
+        if temporary:
+            try:
+                os.unlink(temporary, dir_fd=directory_fd)
+            except OSError:
+                pass
+
+
+def write_whatsapp_bridge_dependency_stamp(bridge_dir: Path) -> None:
+    """Atomically record the manifest used by the last successful install."""
+    bridge_dir = Path(bridge_dir)
+    manifest_hash = whatsapp_bridge_manifest_hash(bridge_dir)
+    if not manifest_hash:
+        raise OSError("WhatsApp bridge manifests are unavailable.")
+
+    node_modules = bridge_dir / "node_modules"
+    stamp = node_modules / _WHATSAPP_BRIDGE_DEPENDENCY_STAMP
+    try:
+        try:
+            stamp_state = stamp.lstat()
+        except FileNotFoundError:
+            stamp_state = None
+        if stamp_state is not None and (
+            not stat.S_ISREG(stamp_state.st_mode)
+            or stamp_state.st_size > _MAX_WHATSAPP_BRIDGE_STAMP_BYTES
+        ):
+            raise OSError
+        directory_fd, opened = _open_whatsapp_bridge_directory(node_modules)
+        try:
+            _atomic_write_whatsapp_bridge_file(
+                directory_fd,
+                _WHATSAPP_BRIDGE_DEPENDENCY_STAMP,
+                manifest_hash.encode("ascii"),
+            )
+            os.fsync(directory_fd)
+            after_root = node_modules.lstat()
+            if (
+                not stat.S_ISDIR(after_root.st_mode)
+                or after_root.st_dev != opened.st_dev
+                or after_root.st_ino != opened.st_ino
+            ):
+                raise OSError
+        finally:
+            try:
+                os.close(directory_fd)
+            except OSError:
+                pass
+    except OSError as exc:
+        raise OSError("WhatsApp bridge dependency stamp is unavailable.") from exc
+
+
+def _sync_whatsapp_bridge_source(source: Path, destination: Path) -> None:
+    """Safely refresh only production inputs, preserving all runtime state."""
+    source = Path(source)
+    destination = Path(destination)
+    sync_error = "WhatsApp bridge source synchronization failed."
+
+    # Capture every source byte before touching the destination. Missing names
+    # are represented separately so a stale allowlisted mirror entry can be
+    # removed, but the mirror can never be accepted as complete afterward.
+    try:
+        source_before = source.lstat()
+        if not stat.S_ISDIR(source_before.st_mode):
+            raise OSError
+        payloads: dict[str, Optional[bytes]] = {}
+        missing = False
+        for filename in WHATSAPP_BRIDGE_RUNTIME_INPUTS:
+            try:
+                payloads[filename] = _read_whatsapp_bridge_input(source / filename)
+            except _WhatsAppBridgeInputMissing:
+                payloads[filename] = None
+                missing = True
+            except _WhatsAppBridgeInputInvalid as exc:
+                raise OSError from exc
+        source_after = source.lstat()
+        if (
+            not stat.S_ISDIR(source_after.st_mode)
+            or _bridge_input_stat_fingerprint(source_after)
+            != _bridge_input_stat_fingerprint(source_before)
+        ):
+            raise OSError
+
+        try:
+            destination_state = destination.lstat()
+        except FileNotFoundError:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            parent_state = destination.parent.lstat()
+            if not stat.S_ISDIR(parent_state.st_mode):
+                raise OSError
+            destination.mkdir(mode=0o700)
+        else:
+            if not stat.S_ISDIR(destination_state.st_mode):
+                raise OSError
+
+        destination_fd, opened_root = _open_whatsapp_bridge_directory(destination)
+        try:
+            # Validate every destination production entry before the first
+            # replacement/removal. Symlinks, FIFOs, devices, directories,
+            # unreadable files, and oversized files all fail closed.
+            destination_states: dict[str, Optional[tuple[int, ...]]] = {}
+            for filename in WHATSAPP_BRIDGE_RUNTIME_INPUTS:
+                destination_path = destination / filename
+                try:
+                    state = destination_path.lstat()
+                except FileNotFoundError:
+                    destination_states[filename] = None
+                    continue
+                if (
+                    not stat.S_ISREG(state.st_mode)
+                    or state.st_size < 0
+                    or state.st_size > _MAX_WHATSAPP_BRIDGE_INPUT_BYTES
+                ):
+                    raise OSError
+                _read_whatsapp_bridge_input(destination_path)
+                stable_state = destination_path.lstat()
+                if (
+                    _bridge_input_stat_fingerprint(stable_state)
+                    != _bridge_input_stat_fingerprint(state)
+                ):
+                    raise OSError
+                destination_states[filename] = _bridge_input_stat_fingerprint(
+                    stable_state
+                )
+
+            root_now = destination.lstat()
+            if (
+                not stat.S_ISDIR(root_now.st_mode)
+                or root_now.st_dev != opened_root.st_dev
+                or root_now.st_ino != opened_root.st_ino
+            ):
+                raise OSError
+
+            for filename in WHATSAPP_BRIDGE_RUNTIME_INPUTS:
+                expected = destination_states[filename]
+                try:
+                    current = os.stat(
+                        filename, dir_fd=destination_fd, follow_symlinks=False
+                    )
+                    current_fingerprint: Optional[tuple[int, ...]] = (
+                        _bridge_input_stat_fingerprint(current)
+                    )
+                except FileNotFoundError:
+                    current_fingerprint = None
+                if current_fingerprint != expected:
+                    raise OSError
+
+                payload = payloads[filename]
+                if payload is None:
+                    if expected is not None:
+                        os.unlink(filename, dir_fd=destination_fd)
+                    continue
+                _atomic_write_whatsapp_bridge_file(
+                    destination_fd, filename, payload
+                )
+
+            os.fsync(destination_fd)
+            final_root = destination.lstat()
+            if (
+                not stat.S_ISDIR(final_root.st_mode)
+                or final_root.st_dev != opened_root.st_dev
+                or final_root.st_ino != opened_root.st_ino
+            ):
+                raise OSError
+        finally:
+            os.close(destination_fd)
+
+        if missing:
+            raise OSError
+    except OSError as exc:
+        raise OSError(sync_error) from exc
+
 
 def resolve_whatsapp_bridge_dir() -> Path:
     """Resolve the WhatsApp bridge directory, mirroring to HERMES_HOME if needed.
@@ -512,7 +1138,6 @@ def resolve_whatsapp_bridge_dir() -> Path:
 
     Returns the resolved bridge directory path.
     """
-    import shutil
     from pathlib import Path as _Path
 
     # Default location in install tree (may be read-only)
@@ -523,30 +1148,17 @@ def resolve_whatsapp_bridge_dir() -> Path:
     hermes_home = get_hermes_home()
     hermes_home_bridge = hermes_home / "scripts" / "whatsapp-bridge"
 
-    # Check if install dir is writable
-    try:
-        test_file = install_bridge / ".write_test"
-        test_file.touch()
-        test_file.unlink()
-        install_writable = True
-    except (OSError, PermissionError):
-        install_writable = False
-
-    if install_writable:
+    # Check if the exact install directory is writable without following a
+    # predictable probe path that may already be a symlink.
+    if _whatsapp_bridge_directory_is_writable(install_bridge):
         return install_bridge
 
-    # Install dir is read-only, mirror to HERMES_HOME if needed
-    if hermes_home_bridge.exists():
-        return hermes_home_bridge
-
-    # Mirror the bridge source to HERMES_HOME
+    # Install dir is read-only. Refresh every packaged source file in the
+    # writable mirror so an existing mirror cannot strand an older release.
+    # Runtime-only files and node_modules are deliberately left in place.
     try:
         hermes_home_bridge.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(
-            install_bridge,
-            hermes_home_bridge,
-            dirs_exist_ok=False,
-        )
+        _sync_whatsapp_bridge_source(install_bridge, hermes_home_bridge)
         return hermes_home_bridge
     except Exception:
         return install_bridge

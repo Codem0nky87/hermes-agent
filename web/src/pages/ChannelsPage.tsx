@@ -25,7 +25,7 @@ import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { Switch } from "@nous-research/ui/ui/components/switch";
 import { Toast } from "@nous-research/ui/ui/components/toast";
 import { useToast } from "@nous-research/ui/hooks/use-toast";
-import { api } from "@/lib/api";
+import { api, isWhatsAppResetConfirmationRequired } from "@/lib/api";
 import type {
   MessagingPlatform,
   MessagingPlatformEnvVar,
@@ -114,6 +114,13 @@ function formatExpiry(expiresAt: string): string {
   const rest = seconds % 60;
   return `${minutes}:${rest.toString().padStart(2, "0")}`;
 }
+
+// Fallback for the terminal re-pair state. The server sends this text; the
+// constant only covers a response that omits it. The QR for a re-pair can
+// only be displayed by the local `hermes whatsapp` command — the pairing
+// payload is never sent to, stored by, or rendered in the dashboard.
+const WHATSAPP_REPAIR_REQUIRED_MESSAGE =
+  "WhatsApp needs to be paired again. Run 'hermes whatsapp' in a local terminal.";
 
 function isTerminalTelegramOnboardingError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
@@ -657,7 +664,6 @@ function WhatsAppOnboardingPanel({
   const [setup, setSetup] = useState<WhatsAppOnboardingStartResponse | null>(
     null,
   );
-  const [qrDataUrl, setQrDataUrl] = useState("");
   const [phase, setPhase] = useState<
     "idle" | "starting" | "waiting" | "connected" | "applying"
   >("idle");
@@ -674,16 +680,6 @@ function WhatsAppOnboardingPanel({
     }
   }, [configuredMode, phase, setup]);
 
-  const updateQr = useCallback(async (payload?: string | null) => {
-    if (!payload) return;
-    const dataUrl = await QRCode.toDataURL(payload, {
-      errorCorrectionLevel: "M",
-      margin: 3,
-      width: 240,
-    });
-    setQrDataUrl(dataUrl);
-  }, []);
-
   useEffect(() => {
     if (!setup || phase !== "waiting") return;
     let cancelled = false;
@@ -693,14 +689,23 @@ function WhatsAppOnboardingPanel({
       try {
         const status = await api.getWhatsAppOnboardingStatus(setup.pairing_id);
         if (cancelled) return;
+        // `qr_payload` is deliberately ignored. The dashboard is not a
+        // permitted sink for pairing material, so even a legacy or hostile
+        // server that still sends one must not get it rendered here.
         setSetup(status);
-        if (status.qr_payload && status.qr_payload !== setup.qr_payload) {
-          await updateQr(status.qr_payload);
-        }
-        if (cancelled) return;
         if (status.status === "connected") {
           setPhase("connected");
           setError("");
+          return;
+        }
+        if (status.status === "repair_required") {
+          // Terminal: the run has ended and no QR will ever arrive over this
+          // channel. Stop polling and leave the operator the one instruction
+          // that works.
+          setError(status.error || WHATSAPP_REPAIR_REQUIRED_MESSAGE);
+          setSetup(null);
+          setQrDataUrl("");
+          setPhase("idle");
           return;
         }
         if (status.status === "error") {
@@ -734,7 +739,7 @@ function WhatsAppOnboardingPanel({
       cancelled = true;
       if (timeout) clearTimeout(timeout);
     };
-  }, [phase, setup, updateQr]);
+  }, [phase, setup]);
 
   useEffect(() => {
     if (!setup) return;
@@ -749,7 +754,7 @@ function WhatsAppOnboardingPanel({
     setError("");
   };
 
-  const start = async () => {
+  const start = async (resetRevokedSession = false) => {
     setPhase("starting");
     setError("");
     setQrDataUrl("");
@@ -757,11 +762,18 @@ function WhatsAppOnboardingPanel({
       const res = await api.startWhatsAppOnboarding({
         mode,
         allowed_users: allowedUsers,
+        ...(resetRevokedSession ? { reset_revoked_session: true } : {}),
       });
-      setSetup(res);
-      if (res.qr_payload) {
-        await updateQr(res.qr_payload);
+      if (res.status === "repair_required") {
+        // Terminal before any polling starts: never enter the waiting phase
+        // and never attempt to render a QR for it.
+        setError(res.error || WHATSAPP_REPAIR_REQUIRED_MESSAGE);
+        setSetup(null);
+        setQrDataUrl("");
+        setPhase("idle");
+        return;
       }
+      setSetup(res);
       if (res.status === "error") {
         setError(res.error || "WhatsApp setup failed.");
         setSetup(null);
@@ -770,8 +782,22 @@ function WhatsAppOnboardingPanel({
         setPhase(res.status === "connected" ? "connected" : "waiting");
       }
     } catch (startError) {
+      if (
+        !resetRevokedSession &&
+        isWhatsAppResetConfirmationRequired(startError)
+      ) {
+        const confirmed = window.confirm(
+          "Continuing will permanently delete the current WhatsApp credentials and all session files recursively. You will need to re-pair WhatsApp. Continue?",
+        );
+        if (confirmed) {
+          await start(true);
+        } else {
+          setPhase("idle");
+        }
+        return;
+      }
       setPhase("idle");
-      setError(String(startError));
+      setError("WhatsApp setup could not be started.");
     }
   };
 
@@ -811,10 +837,9 @@ function WhatsAppOnboardingPanel({
     setPhase("applying");
     setError("");
     try {
-      const result = await api.applyWhatsAppOnboarding(setup.pairing_id, {
-        mode,
-        allowed_users: allowedUsers,
-      });
+      // The opaque pairing record captured mode and allowlist at start time;
+      // apply deliberately sends no client-echoed policy values.
+      const result = await api.applyWhatsAppOnboarding(setup.pairing_id, {});
       resetSetup();
       if (result.restart_started) {
         showToast("WhatsApp saved; gateway restarting…", "success");
@@ -849,10 +874,10 @@ function WhatsAppOnboardingPanel({
     phase === "connected" || phase === "applying"
       ? "WhatsApp is linked but Hermes is not listening yet. Save and restart the gateway to finish setup."
       : setup?.status === "installing"
-        ? "Preparing the WhatsApp bridge. The QR code will appear here when it is ready."
+        ? "Preparing the WhatsApp bridge."
         : setup?.status === "starting"
-          ? "Starting the WhatsApp pairing bridge. The QR code will appear here when it is ready."
-          : "Open WhatsApp on your phone, then go to Linked Devices and scan from there. This QR is not a browser URL.";
+          ? "Starting the WhatsApp pairing bridge."
+          : "Re-pairing is done with `hermes whatsapp` in a local terminal — the pairing code is only ever shown there.";
   const linkedAccountLabel = setup?.account_phone
     ? `+${setup.account_phone}`
     : setup?.account_name || setup?.account_id || "";
@@ -888,7 +913,7 @@ function WhatsAppOnboardingPanel({
             disabled={phase === "starting" || phase === "waiting" || phase === "applying"}
             prefix={phase === "starting" ? <Spinner /> : <QrCode className="h-4 w-4" />}
           >
-            {phase === "starting" ? "Starting…" : "Pair with QR"}
+            {phase === "starting" ? "Checking…" : "Check WhatsApp session"}
           </Button>
           {platform.configured && (
             <span className="text-xs text-muted-foreground">
@@ -1007,13 +1032,7 @@ function WhatsAppOnboardingPanel({
             </div>
 
             <div className="flex flex-col items-center justify-center gap-3">
-              {qrDataUrl ? (
-                <img
-                  src={qrDataUrl}
-                  alt="WhatsApp setup QR code"
-                  className="h-60 w-60 bg-white p-2"
-                />
-              ) : phase === "connected" || phase === "applying" ? (
+              {phase === "connected" || phase === "applying" ? (
                 <div className="flex h-60 w-60 flex-col items-center justify-center gap-2 border border-border bg-background/50 p-4 text-center">
                   <Badge tone="success">Linked</Badge>
                   <div className="text-sm text-muted-foreground">
@@ -1024,14 +1043,14 @@ function WhatsAppOnboardingPanel({
                 <div className="flex h-60 w-60 flex-col items-center justify-center gap-3 border border-border bg-background/50 p-4 text-center">
                   <Spinner className="text-2xl" />
                   <div className="text-xs text-muted-foreground">
-                    Waiting for WhatsApp to provide a QR code…
+                    Waiting for WhatsApp…
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    If this session needs re-pairing, run{" "}
+                    <code>hermes whatsapp</code> in a local terminal — the
+                    pairing code is only ever shown there.
                   </div>
                 </div>
-              )}
-              {phase === "waiting" && (
-                <span className="text-center text-xs text-muted-foreground">
-                  Scan with WhatsApp Linked Devices, not the camera app.
-                </span>
               )}
               <Button size="sm" ghost onClick={() => void cancel()}>
                 Cancel

@@ -67,6 +67,35 @@ CASES = {
     "root lockfile → frontend, not python": (["package-lock.json"], _lanes(frontend=True, npm_lock=True)),
     "nested lockfile → npm_lock": (["website/package-lock.json"], _lanes(site=True, npm_lock=True)),
     "website → site": (["website/docs/intro.md"], _lanes(site=True)),
+    # The WhatsApp bridge is a standalone npm package with its own lockfile and
+    # its own js-tests job, so a change there must turn the frontend lane on --
+    # otherwise the bridge's Node tests never run on the PR that breaks them.
+    # It stays python-relevant on purpose: the bridge's exit codes and
+    # revoked-session marker are a contract the Python adapter parses, and the
+    # Python suite is what checks the other side of it.
+    "bridge source → frontend and python": (
+        ["scripts/whatsapp-bridge/bridge.js"],
+        _lanes(python=True, frontend=True),
+    ),
+    "bridge test → frontend and python": (
+        ["scripts/whatsapp-bridge/bridge.connection.test.mjs"],
+        _lanes(python=True, frontend=True),
+    ),
+    "bridge lockfile → frontend and npm_lock": (
+        ["scripts/whatsapp-bridge/package-lock.json"],
+        _lanes(python=True, frontend=True, npm_lock=True),
+    ),
+    # A bridge change alongside a docs edit must not lose either lane.
+    "bridge + docs → frontend and python": (
+        ["scripts/whatsapp-bridge/bridge_helpers.js", "README.md"],
+        _lanes(python=True, frontend=True),
+    ),
+    # Only the bridge package itself is a JS package; other scripts/ paths keep
+    # their existing (Python-only) classification.
+    "other scripts path → not frontend": (
+        ["scripts/ci/classify_changes.py"],
+        _lanes(python=True, scan=True),
+    ),
     # uv lock --check re-resolves against PyPI, so it must stay off for any
     # diff that can't desync the lockfile — a registry blip on a docs PR
     # otherwise shows up as a blocking "uv.lock out of sync" red X.

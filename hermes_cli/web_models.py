@@ -84,6 +84,9 @@ class WhatsAppOnboardingStart(BaseModel):
     mode: Optional[str] = "bot"
     allowed_users: Optional[str] = ""
     profile: Optional[str] = None
+    # Explicitly authorizes destructive recovery for either a terminal marker
+    # or any present credential artifact that cannot be validated as complete.
+    reset_revoked_session: bool = False
 
 
 class WhatsAppOnboardingApply(BaseModel):
@@ -734,4 +737,3 @@ class _PluginProvidersPutBody(BaseModel):
 
 class _PluginVisibilityBody(BaseModel):
     hidden: bool
-

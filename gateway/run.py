@@ -2522,6 +2522,32 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+#: Reason codes the ``pre_gateway_dispatch`` skip record may disclose.
+#:
+#: The hook returns plugin-controlled dicts, so ``reason`` is untrusted free
+#: text. Logging it verbatim would let any loaded plugin write arbitrary
+#: content into the gateway log — and would carry whatever identifiers the
+#: plugin chose to embed. Only these fixed codes survive; anything else is
+#: reported as ``unspecified``.
+_ALLOWED_HOOK_SKIP_REASONS = frozenset(
+    {
+        "plugin-handled",
+        "duplicate",
+        "filtered",
+        "handover",
+        "rate-limited",
+        "unsupported",
+    }
+)
+
+
+def _hook_skip_reason_code(value: object) -> str:
+    """Map a plugin-supplied skip reason onto a fixed, allowlisted code."""
+    if isinstance(value, str) and value in _ALLOWED_HOOK_SKIP_REASONS:
+        return value
+    return "unspecified"
+
+
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
     Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
@@ -9666,13 +9692,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # otherwise unauthorized users in shared threads (Slack/Telegram/Discord)
         # can inject messages into an active session they don't own.
         if not self._is_user_authorized(event.source):
+            # Identity boundary: the same omission as the cold path above.
+            # session_key is withheld too — it is built from the chat id, so
+            # logging it would reintroduce the raw JID this record just dropped.
             logger.warning(
-                "Dropping message from unauthorized user in active session: "
-                "user=%s (%s), platform=%s, session=%s",
-                event.source.user_id,
-                event.source.user_name,
+                "Dropping message from unauthorized user in active session "
+                "on %s",
                 event.source.platform.value if event.source.platform else "unknown",
-                session_key,
             )
             return True  # handled (silently dropped); do not fall through
 
@@ -15960,11 +15986,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     continue
                 _action = _result.get("action")
                 if _action == "skip":
+                    # Identity boundary: `reason` is plugin-supplied free text
+                    # (any loaded plugin can put arbitrary content there) and
+                    # `chat_id` is a raw platform identifier — on WhatsApp a
+                    # bare JID. Log only the generic platform and a fixed
+                    # allowlisted reason code. privacy.redact_pii does not
+                    # cover this: it governs LLM session-context rendering,
+                    # and RedactingFormatter is a secret formatter that does
+                    # not remove bare JIDs. Omitting the identity is the fix;
+                    # an unkeyed hash would still be a stable correlator.
                     logger.info(
-                        "pre_gateway_dispatch skip: reason=%s platform=%s chat=%s",
-                        _result.get("reason"),
+                        "pre_gateway_dispatch skip: reason=%s platform=%s",
+                        _hook_skip_reason_code(_result.get("reason")),
                         source.platform.value if source.platform else "unknown",
-                        source.chat_id or "unknown",
                     )
                     return None
                 if _action == "rewrite":
@@ -15989,7 +16023,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("Ignoring message with no user_id from %s", source.platform.value)
                 return None
         elif not self._is_user_authorized(source):
-            logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
+            # Identity boundary: user_id/user_name are raw platform identity
+            # (a bare WhatsApp JID and the sender's display name). The platform
+            # alone is enough to act on this record; the identity is omitted
+            # rather than hashed, since an unkeyed hash of a phone-number-shaped
+            # JID is trivially reversible and still correlates across records.
+            logger.warning("Unauthorized user on %s", source.platform.value)
             # In DMs: offer pairing code. In groups: silently ignore.
             if (
                 source.chat_type == "dm"

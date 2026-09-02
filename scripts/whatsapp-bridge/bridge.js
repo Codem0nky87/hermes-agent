@@ -19,26 +19,31 @@
  *   node bridge.js --port 3000 --session ~/.hermes/whatsapp/session
  */
 
-import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, getAggregateVotesInPollMessage, decryptPollVote, getKeyAuthor, jidNormalizedUser } from '@whiskeysockets/baileys';
+import { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, downloadMediaMessage, getAggregateVotesInPollMessage, decryptPollVote, getKeyAuthor, jidNormalizedUser } from '@whiskeysockets/baileys';
 import express from 'express';
-import { Boom } from '@hapi/boom';
-import pino from 'pino';
 import path from 'path';
 import { mkdirSync, readFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
 import { fileURLToPath } from 'url';
-import { randomBytes, createHash } from 'crypto';
+import { randomBytes } from 'crypto';
 import { execFileSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
+import { createBaileysLogger, boundedLogText } from './baileys_logger.js';
+import { createConnectionCloseHandler, describeDisconnect } from './connection_close.js';
 import {
+  BRIDGE_EXIT_LOGGED_OUT,
+  BRIDGE_EXIT_REPAIR_REQUIRED,
+  buildIgnoredMessageEvent,
   buildPollPayload,
   createReconnectScheduler,
   createVersionResolver,
+  readSessionRevokedMarker,
   buildLocationPayload,
   buildTextSendPayload,
+  computeBridgeRuntimeHash,
   createBoundedMessageStore,
   extractBridgeEvent,
   inboundReadReceiptKeys,
@@ -96,21 +101,35 @@ const DOCUMENT_CACHE_DIR = process.env.HERMES_DOCUMENT_CACHE_DIR
 const AUDIO_CACHE_DIR = process.env.HERMES_AUDIO_CACHE_DIR
   || path.join(process.env.HOME || '~', '.hermes', 'audio_cache');
 
-// Self-hash of this script file.  Reported in /health so the Python gateway
-// can detect a running bridge that predates the current bridge.js and
-// restart it instead of silently reusing stale code (stale-bridge trap:
-// `hermes update` updates bridge.js on disk but a long-lived bridge process
-// keeps serving the old behavior forever).
-let SCRIPT_HASH = '';
+// Composite hash of every local production input loaded by bridge behavior.
+// Keep reporting it as scriptHash for older adapters, while runtimeHash names
+// the expanded contract explicitly. A required input that is missing,
+// substituted, nonregular, oversized, unreadable, or changed during its
+// bounded no-follow read is a startup failure rather than a reusable hash.
+let RUNTIME_HASH = '';
 try {
-  SCRIPT_HASH = createHash('sha256')
-    .update(readFileSync(fileURLToPath(import.meta.url)))
-    .digest('hex')
-    .slice(0, 16);
-} catch {}
+  RUNTIME_HASH = computeBridgeRuntimeHash(
+    path.dirname(fileURLToPath(import.meta.url)),
+  );
+} catch {
+  console.error('[bridge] WhatsApp bridge runtime inputs are unavailable.');
+  process.exit(1);
+}
+// Everything this process creates is WhatsApp session state: credentials, the
+// auth directory, and the files Baileys rewrites on every `creds.update`.
+// Baileys writes them with plain fs calls, so their modes are `0666 & ~umask`
+// / `0777 & ~umask` — on a normal host that is a world-readable credential and
+// a world-traversable session directory. Inheriting the launching shell's
+// umask makes that an ambient, host-dependent property; setting it here makes
+// owner-only the process-wide floor no matter how the bridge was started.
+process.umask(0o077);
+
 const PAIR_ONLY = args.includes('--pair-only');
 const PAIR_JSON = args.includes('--pair-json');
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
+const DIAGNOSTIC_WHATSAPP_MODE = new Set(['bot', 'self-chat']).has(WHATSAPP_MODE)
+  ? WHATSAPP_MODE
+  : 'other';
 const WHATSAPP_DM_POLICY = String(process.env.WHATSAPP_DM_POLICY || 'open').trim().toLowerCase();
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
 const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n────────────\n';
@@ -208,20 +227,63 @@ function normalizeWhatsAppId(value) {
   return String(value).replace(':', '@');
 }
 
-function redactWhatsAppId(value) {
-  const raw = String(value || '').trim();
-  if (!raw) return '';
-  const [userPart, domainPart = ''] = raw.split('@', 2);
-  const bare = userPart.split(':', 1)[0];
-  const digits = bare.replace(/\D/g, '');
-  const suffix = digits ? digits.slice(-4) : bare.slice(-4);
-  return `${suffix ? `…${suffix}` : '…'}${domainPart ? `@${domainPart}` : ''}`;
+const MAX_DIAGNOSTIC_COUNT = 1000;
+const DEBUG_STAGES = new Set(['upsert', 'ignored', 'self_chat_check', 'queued']);
+const DEBUG_REASONS = new Set([
+  'agent_echo',
+  'empty',
+  'foreign_poll_update',
+  'from_me_group',
+  'from_me_status',
+  'self_chat_mismatch',
+]);
+const DEBUG_DELIVERY_TYPES = new Set(['notify', 'append']);
+const DEBUG_BOOLEAN_FIELDS = ['fromMe', 'matched', 'fromOwner', 'hasMedia'];
+const DEBUG_COUNT_FIELDS = ['bodyLength', 'queueLength'];
+
+function boundedDiagnosticCount(value) {
+  return Number.isSafeInteger(value) && value > 0
+    ? Math.min(value, MAX_DIAGNOSTIC_COUNT)
+    : 0;
 }
 
 function emitDebugEvent(payload) {
   if (!WHATSAPP_DEBUG) return;
   try {
-    console.log(JSON.stringify({ event: 'debug', ...payload }));
+    // Debug output lands in the same dashboard-visible log as ordinary output.
+    // Build it field by field: never spread an object from the message loop,
+    // where ids, content keys and server values are all in scope.
+    const event = {
+      event: 'debug',
+      stage: DEBUG_STAGES.has(payload?.stage) ? payload.stage : 'ignored',
+    };
+    if (payload?.reason !== undefined) {
+      event.reason = DEBUG_REASONS.has(payload.reason) ? payload.reason : 'other';
+    }
+    if (payload?.deliveryType !== undefined) {
+      event.deliveryType = DEBUG_DELIVERY_TYPES.has(payload.deliveryType) ? payload.deliveryType : 'other';
+    }
+    for (const field of DEBUG_BOOLEAN_FIELDS) {
+      if (typeof payload?.[field] === 'boolean') event[field] = payload[field];
+    }
+    for (const field of DEBUG_COUNT_FIELDS) {
+      if (payload?.[field] !== undefined) event[field] = boundedDiagnosticCount(payload[field]);
+    }
+    console.log(JSON.stringify(event));
+  } catch {}
+}
+
+/**
+ * Report that a message was declined, naming the policy rule and nothing else.
+ *
+ * The event is built by `buildIgnoredMessageEvent`, which fixes the shape —
+ * see the note there for why the chat/sender identities do not belong on this
+ * stream. Debug-level tracing of rejections names only the same fixed policy
+ * reason; even a recognisable identity suffix is still an identity.
+ */
+function emitIgnoredEvent(reason) {
+  try {
+    console.log(JSON.stringify(buildIgnoredMessageEvent(reason)));
   } catch {}
 }
 
@@ -265,7 +327,12 @@ function buildLidMap() {
 }
 let lidToPhone = buildLidMap();
 
-const logger = pino({ level: 'warn' });
+// Baileys logs binary stream nodes, Boom errors still holding those nodes on
+// `.data`, and slices of auth state. This logger keeps none of what it is
+// handed — only the level and a bridge-owned message — so none of that can
+// reach the bridge log. The disconnect diagnostics an operator needs are
+// emitted by the close handler below, from metadata it bounds itself.
+const logger = createBaileysLogger({ level: 'warn' });
 
 // Message queue for polling
 const messageQueue = [];
@@ -298,25 +365,42 @@ function normalizePollUpdateOptions(aggregation, pollUpdateMessage, meId) {
   return raw.map(option => String(option)).filter(Boolean);
 }
 
-function pollAggregationSummary(aggregation) {
-  return (aggregation || []).map(option => ({
-    name: option?.name || '',
-    voterCount: (option?.voters || []).length,
-  }));
+function boundedArrayCount(value) {
+  try {
+    return boundedDiagnosticCount(Array.isArray(value) ? value.length : 0);
+  } catch {
+    return 0;
+  }
 }
 
-function logPollUpdateDiagnostic({ sourcePath, pollId, pollCreation, pollUpdates, selectedOptions, aggregation }) {
-  const firstUpdate = pollUpdates?.[0] || {};
+function boundedAggregationVoterCount(aggregation) {
+  if (!Array.isArray(aggregation)) return 0;
+  let count = 0;
+  try {
+    for (let index = 0; index < Math.min(aggregation.length, MAX_DIAGNOSTIC_COUNT); index += 1) {
+      count += boundedArrayCount(aggregation[index]?.voters);
+      if (count >= MAX_DIAGNOSTIC_COUNT) return MAX_DIAGNOSTIC_COUNT;
+    }
+  } catch {
+    return 0;
+  }
+  return boundedDiagnosticCount(count);
+}
+
+const POLL_DIAGNOSTIC_SOURCES = new Set(['messages.update', 'messages.upsert']);
+
+function logPollUpdateDiagnostic({ sourcePath, pollCreation, pollUpdates, selectedOptions, aggregation }) {
+  const firstUpdate = Array.isArray(pollUpdates) ? pollUpdates[0] : null;
   try {
     console.log(JSON.stringify({
       event: 'poll_update_decode',
-      sourcePath,
-      pollId: pollId || '',
+      source: POLL_DIAGNOSTIC_SOURCES.has(sourcePath) ? sourcePath : 'other',
       pollCreationFound: !!pollCreation,
-      updateKeys: Object.keys(firstUpdate),
-      hasVote: !!firstUpdate.vote,
-      selectedOptionsLength: selectedOptions?.length || 0,
-      aggregation: pollAggregationSummary(aggregation),
+      updateCount: boundedArrayCount(pollUpdates),
+      hasVote: !!firstUpdate?.vote,
+      selectedOptionCount: boundedArrayCount(selectedOptions),
+      aggregationOptionCount: boundedArrayCount(aggregation),
+      aggregationVoterCount: boundedAggregationVoterCount(aggregation),
     }));
   } catch {}
 }
@@ -336,9 +420,7 @@ function enqueuePollUpdateEvent({ key, update, selectedOptions, aggregation }) {
   // /send-poll returns). Arbitrary human polls in a group chat must not
   // inject agent-visible messages on every vote.
   if (!pollId || !recentlySentIds.has(pollId)) {
-    if (WHATSAPP_DEBUG) {
-      try { console.log(JSON.stringify({ event: 'ignored', reason: 'foreign_poll_update', pollId })); } catch {}
-    }
+    emitDebugEvent({ stage: 'ignored', reason: 'foreign_poll_update' });
     return;
   }
   const chosenText = selectedOptions.length ? selectedOptions.join(', ') : `[Poll update${pollId ? `: ${pollId}` : ''}]`;
@@ -398,7 +480,39 @@ function emitPairEvent(event) {
 const scheduleReconnect = createReconnectScheduler(() => startSocket());
 const getWAVersion = createVersionResolver(fetchLatestBaileysVersion);
 
+/**
+ * Human-facing log sink. In `--pair-json` mode stdout carries one JSON event
+ * per line for the dashboard/CLI to parse, so prose lines are dropped rather
+ * than interleaved into that stream.
+ */
+const operatorLog = PAIR_JSON ? () => {} : console.log;
+
+const handleConnectionClose = createConnectionCloseHandler({
+  sessionDir: SESSION_DIR,
+  emitPairEvent,
+  log: operatorLog,
+  scheduleReconnect,
+  exit: (code) => process.exit(code),
+});
+
 async function startSocket() {
+  // A previous run recorded that WhatsApp revoked this session. Opening a
+  // socket would only get it revoked again, so refuse before touching the
+  // network — this is the guarantee that survives process death, and the one
+  // that holds when nobody is watching our exit code. Cleared only by
+  // replacing the session directory (`hermes whatsapp` re-pairing rmtree()s
+  // it), so a re-paired session starts unmarked.
+  const revoked = readSessionRevokedMarker(SESSION_DIR);
+  if (revoked) {
+    const streamReason = describeDisconnect(revoked);
+    emitPairEvent({ event: 'error', error: 'logged_out', reason: revoked.statusCode, streamReason });
+    if (!PAIR_JSON) {
+      console.log(`❌ This WhatsApp session was revoked by WhatsApp${streamReason ? ` (${streamReason})` : ''}.`);
+      console.log('   Re-pair with `hermes whatsapp` — reconnecting cannot recover this session.');
+    }
+    process.exit(BRIDGE_EXIT_LOGGED_OUT);
+  }
+
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
   const version = await getWAVersion();
 
@@ -425,46 +539,41 @@ async function startSocket() {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      if (PAIR_JSON) {
-        emitPairEvent({ event: 'qr', qr });
-      } else {
+      // The one permitted QR sink is a real terminal owned by the operator.
+      // --pair-json is consumed by the dashboard/background pairing watcher
+      // over a pipe, which stores and re-serves whatever it receives, so it
+      // is *not* a terminal and must never carry the payload — in the `qr`
+      // field or any other.
+      if (process.stdout.isTTY && !PAIR_JSON) {
+        // The supported one-shot pairing path: stdout is the operator's own
+        // local terminal, so the code is displayed and never persisted.
         console.log('\n📱 Scan this QR code with WhatsApp on your phone:\n');
         qrcode.generate(qr, { small: true });
         console.log('\nWaiting for scan...\n');
+      } else {
+        // Managed gateway (stdout is bridge.log) or a JSON pairing stream.
+        // Rendering or emitting here would move live pairing material into a
+        // file or a watcher process, so stop and let the operator re-pair
+        // deliberately in their own terminal. Both forms carry a fixed,
+        // generic state with no QR payload, JID, or path.
+        emitPairEvent({ event: 'repair_required' });
+        if (!PAIR_JSON) {
+          console.log(
+            '⚠ WhatsApp needs to be paired again. Run `hermes whatsapp` in a local terminal.',
+          );
+        }
+        process.exit(BRIDGE_EXIT_REPAIR_REQUIRED);
       }
     }
 
     if (connection === 'close') {
-      const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
       connectionState = 'disconnected';
-
-      if (reason === DisconnectReason.loggedOut) {
-        emitPairEvent({ event: 'error', error: 'logged_out', reason });
-        if (!PAIR_JSON) {
-          console.log('❌ Logged out. Delete session and restart to re-authenticate.');
-        }
-        process.exit(1);
-      } else {
-        // 515 = restart requested (common after pairing). Always reconnect.
-        emitPairEvent({ event: 'disconnected', reason });
-        if (!PAIR_JSON) {
-          if (reason === 515) {
-            console.log('↻ WhatsApp requested restart (code 515). Reconnecting...');
-          } else {
-            console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in 3s...`);
-          }
-        }
-        scheduleReconnect(reason === 515 ? 1000 : 3000);
-      }
+      handleConnectionClose(lastDisconnect);
     } else if (connection === 'open') {
       connectionState = 'connected';
-      const connectedUser = sock?.user
-        ? {
-            id: sock.user.id || null,
-            name: sock.user.name || sock.user.verifiedName || null,
-          }
-        : null;
-      emitPairEvent({ event: 'connected', user: connectedUser });
+      getWAVersion.confirm(version);
+      scheduleReconnect.resetBackoff();
+      emitPairEvent({ event: 'connected' });
       if (!PAIR_JSON) {
         console.log('✅ WhatsApp connected!');
       }
@@ -513,13 +622,12 @@ async function startSocket() {
             pollUpdates,
           });
         }
-      } catch (err) {
-        console.warn('[bridge] failed to aggregate poll update:', err.message);
+      } catch {
+        console.warn('[bridge] failed to aggregate poll update.');
       }
       const selectedOptions = normalizePollUpdateOptions(aggregation, pollUpdates?.[0]);
       logPollUpdateDiagnostic({
         sourcePath: 'messages.update',
-        pollId: pollCreationId,
         pollCreation,
         pollUpdates,
         selectedOptions,
@@ -548,11 +656,8 @@ async function startSocket() {
       const senderNumber = senderId.replace(/@.*/, '');
       emitDebugEvent({
         stage: 'upsert',
-        type,
+        deliveryType: type,
         fromMe: !!msg.key.fromMe,
-        chatId: redactWhatsAppId(chatId),
-        senderId: redactWhatsAppId(senderId),
-        messageKeys: Object.keys(msg.message || {}),
       });
 
       // Handle fromMe messages based on mode
@@ -562,7 +667,6 @@ async function startSocket() {
           emitDebugEvent({
             stage: 'ignored',
             reason: isGroup ? 'from_me_group' : 'from_me_status',
-            chatId: redactWhatsAppId(chatId),
           });
           continue;
         }
@@ -590,14 +694,7 @@ async function startSocket() {
           if (decision.action === 'drop_echo') continue;
           if (decision.action === 'drop_disabled') continue;
           if (decision.action === 'drop_allowlist') {
-            try {
-              console.log(JSON.stringify({
-                event: 'ignored',
-                reason: 'allowlist_mismatch_owner_chat',
-                chatId,
-                senderId,
-              }));
-            } catch {}
+            emitIgnoredEvent('allowlist_mismatch_owner_chat');
             continue;
           }
           fromOwner = true;
@@ -613,16 +710,11 @@ async function startSocket() {
           emitDebugEvent({
             stage: 'self_chat_check',
             matched: !!isSelfChat,
-            chatId: redactWhatsAppId(chatId),
-            accountId: redactWhatsAppId(sock.user?.id),
-            accountLid: redactWhatsAppId(sock.user?.lid),
           });
           if (!isSelfChat) {
             emitDebugEvent({
               stage: 'ignored',
               reason: 'self_chat_mismatch',
-              chatId: redactWhatsAppId(chatId),
-              senderId: redactWhatsAppId(senderId),
             });
             continue;
           }
@@ -636,25 +728,11 @@ async function startSocket() {
       // to arbitrary incoming messages (#8389).
       if (!msg.key.fromMe) {
         if (WHATSAPP_MODE === 'self-chat') {
-          try {
-            console.log(JSON.stringify({
-              event: 'ignored',
-              reason: 'self_chat_mode_rejects_non_self',
-              chatId,
-              senderId,
-            }));
-          } catch {}
+          emitIgnoredEvent('self_chat_mode_rejects_non_self');
           continue;
         }
         if (WHATSAPP_DM_POLICY !== 'pairing' && !matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
-          try {
-            console.log(JSON.stringify({
-              event: 'ignored',
-              reason: 'allowlist_mismatch',
-              chatId,
-              senderId,
-            }));
-          } catch {}
+          emitIgnoredEvent('allowlist_mismatch');
           continue;
         }
       }
@@ -698,13 +776,12 @@ async function startSocket() {
               pollUpdates,
             });
           }
-        } catch (err) {
-          console.warn('[bridge] failed to aggregate poll upsert:', err.message);
+        } catch {
+          console.warn('[bridge] failed to aggregate poll upsert.');
         }
         const selectedOptions = normalizePollUpdateOptions(aggregation, pollUpdates[0]);
         logPollUpdateDiagnostic({
           sourcePath: 'messages.upsert',
-          pollId: pollKey.id,
           pollCreation,
           pollUpdates,
           selectedOptions,
@@ -737,14 +814,7 @@ async function startSocket() {
 
       // Ignore Hermes' own reply messages in self-chat mode to avoid loops.
       if (msg.key.fromMe && ((REPLY_PREFIX && event.body.startsWith(REPLY_PREFIX)) || recentlySentIds.has(msg.key.id))) {
-        if (WHATSAPP_DEBUG) {
-          emitDebugEvent({
-            stage: 'ignored',
-            reason: 'agent_echo',
-            chatId: redactWhatsAppId(chatId),
-            messageId: msg.key.id,
-          });
-        }
+        emitDebugEvent({ stage: 'ignored', reason: 'agent_echo' });
         continue;
       }
 
@@ -753,8 +823,6 @@ async function startSocket() {
         emitDebugEvent({
           stage: 'ignored',
           reason: 'empty',
-          chatId: redactWhatsAppId(chatId),
-          messageKeys: Object.keys(msg.message || {}),
         });
         continue;
       }
@@ -763,12 +831,9 @@ async function startSocket() {
       messageQueue.push(event);
       emitDebugEvent({
         stage: 'queued',
-        chatId: redactWhatsAppId(chatId),
-        senderId: redactWhatsAppId(senderId),
         fromOwner: !!fromOwner,
         bodyLength: event.body.length,
         hasMedia: event.hasMedia,
-        mediaType: event.mediaType,
         queueLength: messageQueue.length,
       });
       if (messageQueue.length > MAX_QUEUE_SIZE) {
@@ -853,8 +918,8 @@ app.post('/send', async (req, res) => {
       messageId: messageIds[messageIds.length - 1],
       messageIds,
     });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+  } catch {
+    res.status(500).json({ error: 'Failed to send message' });
   }
 });
 
@@ -887,8 +952,8 @@ app.post('/edit', async (req, res) => {
     }
 
     res.json({ success: true, messageIds });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+  } catch {
+    res.status(500).json({ error: 'Failed to edit message' });
   }
 });
 
@@ -905,7 +970,7 @@ app.post('/send-media', async (req, res) => {
 
   try {
     if (!existsSync(filePath)) {
-      return res.status(404).json({ error: `File not found: ${filePath}` });
+      return res.status(404).json({ error: 'File not found' });
     }
 
     const buffer = readFileSync(filePath);
@@ -934,8 +999,8 @@ app.post('/send-media', async (req, res) => {
               mimetype: 'video/mp4',
               gifPlayback: true,
             };
-          } catch (gifErr) {
-            console.warn('[bridge] gif conversion failed, sending as image/gif:', gifErr.message);
+          } catch {
+            console.warn('[bridge] gif conversion failed; sending as image/gif.');
             msgPayload = mediaPayloadForFile({ buffer, filePath, mediaType: type, caption, fileName });
           } finally {
             try { if (tmpGifMp4 && existsSync(tmpGifMp4)) unlinkSync(tmpGifMp4); } catch (_) {}
@@ -965,9 +1030,9 @@ app.post('/send-media', async (req, res) => {
             );
             audioBuffer = readFileSync(tmpPath);
             audioExt = 'ogg';
-          } catch (convErr) {
+          } catch {
             // ffmpeg not available or conversion failed — fall back to original format
-            console.warn('[bridge] ffmpeg conversion failed, sending as file attachment:', convErr.message);
+            console.warn('[bridge] audio conversion failed; sending as file attachment.');
           } finally {
             try { if (tmpPath && existsSync(tmpPath)) unlinkSync(tmpPath); } catch (_) {}
           }
@@ -986,8 +1051,8 @@ app.post('/send-media', async (req, res) => {
     trackSentMessageId(sent);
     messageStore.remember(sent);
     res.json({ success: true, messageId: sent?.key?.id });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+  } catch {
+    res.status(500).json({ error: 'Failed to send media' });
   }
 });
 
@@ -1010,8 +1075,8 @@ app.post('/send-poll', async (req, res) => {
     trackSentMessageId(sent);
     rememberSentMessage(sent, payload);
     res.json({ success: true, messageId: sent?.key?.id });
-  } catch (err) {
-    res.status(400).json({ error: err.message });
+  } catch {
+    res.status(400).json({ error: 'Failed to send poll' });
   }
 });
 
@@ -1032,8 +1097,8 @@ app.post('/send-location', async (req, res) => {
     trackSentMessageId(sent);
     messageStore.remember(sent);
     res.json({ success: true, messageId: sent?.key?.id });
-  } catch (err) {
-    res.status(400).json({ error: err.message });
+  } catch {
+    res.status(400).json({ error: 'Failed to send location' });
   }
 });
 
@@ -1072,8 +1137,8 @@ app.post('/read', async (req, res) => {
   try {
     await sock.readMessages(receiptKeys);
     return res.json({ success: true, marked: true });
-  } catch (err) {
-    console.warn('[bridge] failed to send read receipt:', err.message);
+  } catch {
+    console.warn('[bridge] failed to send read receipt.');
     return res.status(500).json({ error: 'Failed to send read receipt' });
   }
 });
@@ -1109,7 +1174,8 @@ app.get('/health', (req, res) => {
     status: connectionState,
     queueLength: messageQueue.length,
     uptime: process.uptime(),
-    scriptHash: SCRIPT_HASH,
+    scriptHash: RUNTIME_HASH,
+    runtimeHash: RUNTIME_HASH,
     sendReadReceipts: SEND_READ_RECEIPTS,
   });
 });
@@ -1118,25 +1184,36 @@ app.get('/health', (req, res) => {
 if (PAIR_ONLY) {
   // Pair-only mode: just connect, show QR, save creds, exit. No HTTP server.
   if (PAIR_JSON) {
-    emitPairEvent({ event: 'started', session: SESSION_DIR });
+    // No session path: this stream is parsed by the dashboard and the CLI,
+    // and the absolute path spells out the OS user's home directory. The
+    // caller passed --session, so it already knows where the session lives.
+    emitPairEvent({ event: 'started' });
   } else {
     console.log('📱 WhatsApp pairing mode');
-    console.log(`📁 Session: ${SESSION_DIR}`);
     console.log();
   }
   startSocket().catch((err) => {
-    emitPairEvent({ event: 'error', error: err?.message || String(err) });
+    // Bounded: `err` here can be a Baileys error still carrying a binary
+    // stream node, and both sinks below are read back by the dashboard.
+    const safeError = boundedLogText(err, 'WhatsApp pairing failed.');
+    emitPairEvent({ event: 'error', error: safeError });
     if (!PAIR_JSON) {
-      console.error(err);
+      console.error(`❌ ${safeError}`);
     }
     process.exit(1);
   });
 } else {
   app.listen(PORT, '127.0.0.1', () => {
-    console.log(`🌉 WhatsApp bridge listening on port ${PORT} (mode: ${WHATSAPP_MODE})`);
-    console.log(`📁 Session stored in: ${SESSION_DIR}`);
-    if (ALLOWED_USERS.size > 0) {
-      console.log(`🔒 Allowed users: ${Array.from(ALLOWED_USERS).join(', ')}`);
+    console.log(`🌉 WhatsApp bridge listening on port ${PORT} (mode: ${DIAGNOSTIC_WHATSAPP_MODE})`);
+    // Neither the session path nor the allowlisted numbers are logged: this
+    // output is redirected to a log file the dashboard can display, the path
+    // spells out the OS user's home directory, and the numbers are the
+    // operator's and their contacts' real identities. Size and mode are the
+    // parts an operator actually acts on.
+    if (ALLOWED_USERS.has('*')) {
+      console.log(`🔓 Allowlist is open (WHATSAPP_ALLOWED_USERS=*) — every sender is accepted.`);
+    } else if (ALLOWED_USERS.size > 0) {
+      console.log(`🔒 Allowlist: ${ALLOWED_USERS.size} entr${ALLOWED_USERS.size === 1 ? 'y' : 'ies'} configured (numbers not logged).`);
     } else if (WHATSAPP_MODE === 'self-chat') {
       console.log(`🔒 Self-chat mode — only your own messages to yourself are processed.`);
     } else if (WHATSAPP_MODE === 'bot' && WHATSAPP_DM_POLICY === 'pairing') {
@@ -1150,6 +1227,6 @@ if (PAIR_ONLY) {
       console.log(`👤 WHATSAPP_FORWARD_OWNER_MESSAGES=true — owner-typed messages will be forwarded with fromOwner:true`);
     }
     console.log();
-    scheduleReconnect(0);
+    scheduleReconnect(0, { initial: true });
   });
 }

@@ -6275,14 +6275,18 @@ class BasePlatformAdapter(ABC):
                 and interrupt_event.is_set()
                 and session_key in self._pending_messages
             ):
+                # Identity boundary: session_key is derived from the chat id,
+                # so interpolating it publishes the same raw JID.
                 logger.info(
-                    "[%s] Suppressing stale response for interrupted session %s",
+                    "[%s] Suppressing stale response for interrupted session",
                     self.name,
-                    session_key,
                 )
                 response = None
             if not response:
-                logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
+                # Identity boundary: chat_id is a raw platform identifier (a
+                # bare JID on WhatsApp). The adapter name is enough to locate
+                # this record; the chat identity is omitted, not hashed.
+                logger.debug("[%s] Handler returned empty/None response", self.name)
             if response:
                 # Capture [[as_document]] before extract_media strips it, so the
                 # dispatch partition below can route image-extension files
@@ -6707,11 +6711,14 @@ class BasePlatformAdapter(ABC):
                     or images or local_files or media_files
                 )
                 if not _anything_delivered and _response_pre_extract.strip():
+                    # Identity boundary: the length is the actionable signal;
+                    # the chat identity is omitted (see the empty-handler
+                    # record above).
                     logger.error(
                         "[%s] response_delivery_dropped: non-empty response "
                         "(%d chars) produced no delivered message or attachment "
-                        "for %s (empty after extract, recovery yielded nothing).",
-                        self.name, len(_response_pre_extract), event.source.chat_id,
+                        "(empty after extract, recovery yielded nothing).",
+                        self.name, len(_response_pre_extract),
                     )
 
             # Determine overall success for the processing hook

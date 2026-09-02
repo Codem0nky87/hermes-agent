@@ -2900,6 +2900,160 @@ def cmd_proxy(args):
         raise SystemExit(rc)
 
 
+def _print_session_clear_failed():
+    """Report a failed session clear without echoing the OSError.
+
+    An OSError stringifies to something like ``[Errno 13] Permission denied:
+    '/Users/alice/.hermes/whatsapp/session'``, so interpolating it puts the
+    operator's home directory — and therefore their username — on a terminal
+    that routinely gets screenshotted into bug reports.  It tells the reader
+    nothing they can act on either: they just ran ``hermes whatsapp``, so they
+    know which session this is, and the remedy is the same whatever the errno.
+    """
+    print("\n  ✗ The session could not be cleared.")
+    print("    Check the permissions on the session directory and try again.")
+
+
+def _print_whatsapp_pairing_failed() -> None:
+    """Report pair-only failure without child output, identity, or filesystem data."""
+    print("\n  ✗ WhatsApp pairing failed.")
+    print("    Run 'hermes whatsapp' to try again.")
+
+
+def _print_whatsapp_disable_failed() -> None:
+    """Report a fail-closed configuration write without exception-controlled text."""
+    print("\n  ✗ WhatsApp could not be disabled, so pairing was not started.")
+    print("    Check configuration permissions and try again.")
+
+
+def _print_whatsapp_enable_failed() -> None:
+    """Report a final enable-write failure without exception-controlled text."""
+    print("\n  ✗ WhatsApp was paired but could not be enabled.")
+    print("    Check configuration permissions and run 'hermes whatsapp' again.")
+
+
+def _print_whatsapp_bridge_missing() -> None:
+    """Report a missing bridge without disclosing its resolved install path."""
+    print("\n  ✗ The WhatsApp bridge script was not found.")
+    print("    Reinstall or update Hermes, then try again.")
+
+
+def _print_whatsapp_dependency_install_failed() -> None:
+    """Report npm failure without reflecting child output or executable paths."""
+    print("\n  ✗ WhatsApp bridge dependencies could not be installed.")
+    print("    Check Node.js and npm, then try again.")
+
+
+_WHATSAPP_CREDENTIAL_MAX_BYTES = 1024 * 1024
+
+
+def _read_bounded_whatsapp_credentials(path: Path) -> dict | None:
+    """Read one bounded regular credential file without following a final link."""
+    try:
+        before = os.lstat(path)
+    except (OSError, ValueError):
+        return None
+    if not stat.S_ISREG(before.st_mode):
+        return None
+    if before.st_size <= 0 or before.st_size > _WHATSAPP_CREDENTIAL_MAX_BYTES:
+        return None
+
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    fd: int | None = None
+    try:
+        fd = os.open(path, flags)
+        opened = os.fstat(fd)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_dev != before.st_dev
+            or opened.st_ino != before.st_ino
+            or opened.st_size <= 0
+            or opened.st_size > _WHATSAPP_CREDENTIAL_MAX_BYTES
+        ):
+            return None
+        # Owner-only credential state, checked on the descriptor. A file
+        # readable by group/other is already disclosed, and one owned by
+        # another user is not ours to trust.
+        if hasattr(os, "getuid") and opened.st_uid != os.getuid():
+            return None
+        if stat.S_IMODE(opened.st_mode) != 0o600:
+            return None
+
+        chunks: list[bytes] = []
+        total = 0
+        while total <= _WHATSAPP_CREDENTIAL_MAX_BYTES:
+            chunk = os.read(
+                fd,
+                min(64 * 1024, _WHATSAPP_CREDENTIAL_MAX_BYTES + 1 - total),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total == 0 or total > _WHATSAPP_CREDENTIAL_MAX_BYTES:
+            return None
+
+        after = os.fstat(fd)
+        if (
+            after.st_dev != opened.st_dev
+            or after.st_ino != opened.st_ino
+            or after.st_size != opened.st_size
+            or after.st_mtime_ns != opened.st_mtime_ns
+        ):
+            return None
+        payload = json.loads(b"".join(chunks).decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    return payload if isinstance(payload, dict) else None
+
+
+def _whatsapp_pairing_credentials_complete(session_dir: Path) -> bool:
+    """Validate the minimum local Baileys identity written by a completed pair."""
+    payload = _read_bounded_whatsapp_credentials(session_dir / "creds.json")
+    if payload is None:
+        return False
+    me = payload.get("me")
+    if not isinstance(me, dict):
+        return False
+    account_id = me.get("id")
+    return isinstance(account_id, str) and bool(account_id.strip())
+
+
+def _whatsapp_credential_artifact_present(session_dir: Path) -> bool:
+    """Return false only when the credential path is demonstrably absent."""
+    try:
+        os.lstat(session_dir / "creds.json")
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        return True
+    return True
+
+
+def _print_whatsapp_pairing_instructions(wa_mode: str) -> None:
+    """Show QR pairing instructions while the caller owns recovery locks."""
+    print()
+    print("─" * 50)
+    if wa_mode == "bot":
+        print("📱 Open WhatsApp (or WhatsApp Business) on the")
+        print("   phone with the BOT's number, then scan:")
+    else:
+        print("📱 Open WhatsApp on your phone, then scan:")
+    print()
+    print("   Settings → Linked Devices → Link a Device")
+    print("─" * 50)
+    print()
+
+
 def cmd_whatsapp(args):
     """Set up WhatsApp: choose mode, configure, install bridge, pair via QR."""
     _require_tty("whatsapp")
@@ -2976,7 +3130,7 @@ def cmd_whatsapp(args):
     # ── Step 3: Allowed users ────────────────────────────────────────────
     current_users = get_env_value("WHATSAPP_ALLOWED_USERS") or ""
     if current_users:
-        print(f"✓ Allowed users: {current_users}")
+        print("✓ Allowed users are configured")
         try:
             response = input("\n  Update allowed users? [y/N] ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -2990,7 +3144,7 @@ def cmd_whatsapp(args):
                 phone = input("  Your phone number (e.g. 15551234567): ").strip()
             if phone:
                 save_env_value("WHATSAPP_ALLOWED_USERS", phone.replace(" ", ""))
-                print(f"  ✓ Updated to: {phone}")
+                print("  ✓ Allowed users updated")
     else:
         print()
         if wa_mode == "bot":
@@ -3002,56 +3156,64 @@ def cmd_whatsapp(args):
             phone = input("  Your phone number (e.g. 15551234567): ").strip()
         if phone:
             save_env_value("WHATSAPP_ALLOWED_USERS", phone.replace(" ", ""))
-            print(f"  ✓ Allowed users set: {phone}")
+            print("  ✓ Allowed users configured")
         else:
             print("  ⚠ No allowlist — the agent will respond to ALL incoming messages")
 
-    # ── Step 4: Install bridge dependencies ──────────────────────────────
-    from gateway.platforms.whatsapp_common import resolve_whatsapp_bridge_dir
+    # ── Step 4: Inspect the local session before mutating dependencies ────
+    # A user who keeps a complete session does not need npm installation. An
+    # actual pair attempt installs only after the recovery lease has excluded
+    # a live bridge and the configuration has been persisted disabled.
+    from gateway.platforms.whatsapp_common import (
+        is_whatsapp_session_revoked,
+        resolve_whatsapp_bridge_dir,
+        whatsapp_bridge_dependencies_fresh,
+        write_whatsapp_bridge_dependency_stamp,
+    )
+
     bridge_dir = resolve_whatsapp_bridge_dir()
     bridge_script = bridge_dir / "bridge.js"
-
-    if not bridge_script.exists():
-        print(f"\n✗ Bridge script not found at {bridge_script}")
-        return
-
-    if not (bridge_dir / "node_modules").exists():
-        print(
-            "\n→ Installing WhatsApp bridge dependencies (this can take a few minutes)..."
-        )
-        npm = find_node_executable("npm")
-        if not npm:
-            print("  ✗ npm not found on PATH — install Node.js first")
-            return
-        try:
-            result = subprocess.run(
-                [npm, "install", "--no-fund", "--no-audit", "--progress=false"],
-                cwd=str(bridge_dir),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                env=with_hermes_node_path(),
-            )
-        except KeyboardInterrupt:
-            print("\n  ✗ Install cancelled")
-            return
-        if result.returncode != 0:
-            err = (result.stderr or "").strip()
-            preview = "\n".join(err.splitlines()[-30:]) if err else "(no output)"
-            print("  ✗ npm install failed:")
-            print(preview)
-            return
-        print("  ✓ Dependencies installed")
-    else:
-        print("✓ Bridge dependencies already installed")
-
-    # ── Step 5: Check for existing session ───────────────────────────────
     session_dir = get_hermes_home() / "whatsapp" / "session"
-    session_dir.mkdir(parents=True, exist_ok=True)
 
-    if (session_dir / "creds.json").exists():
+    # Imported here rather than through the WhatsApp adapter: `hermes
+    # whatsapp` must not pull bridge runtime machinery into the CLI's import
+    # graph merely to inspect the recovery marker.
+    from gateway.platforms.whatsapp_recovery import (
+        WhatsAppRecoveryError,
+        acquire_whatsapp_recovery_lease,
+    )
+
+    reset_required = False
+
+    # A revoked session is checked BEFORE creds.json, and independently of
+    # it. WhatsApp has removed this device account-side, so those credentials
+    # can never be accepted again — the old prompt appeared only when
+    # creds.json existed (so a marker left without one skipped it entirely),
+    # defaulted to *no*, and then announced "configured and paired!" about a
+    # session WhatsApp had already killed.
+    #
+    # Clearing credentials is destructive, so it still takes an explicit yes.
+    # What changes is that the user is told the truth, is asked at all, and
+    # declining no longer claims a working pairing or enables WhatsApp.
+    if is_whatsapp_session_revoked(session_dir):
+        print("⚠️  This WhatsApp session was revoked by WhatsApp (device removed).")
+        print("   Reconnecting cannot recover it — the session must be re-paired.")
+        try:
+            response = input(
+                "\n  Clear this session and re-pair now? [y/N] "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            response = "n"
+        if response.lower() not in {"y", "yes"}:
+            # Left exactly as found, and deliberately silent about being
+            # configured. WHATSAPP_ENABLED is not written either way, so a
+            # user who already had it enabled keeps it enabled — what stops
+            # the gateway hammering the dead session is the revocation marker
+            # the adapter reads, not this command's choice not to touch .env.
+            print("\n  Session left unchanged. Run `hermes whatsapp` again to re-pair.")
+            return
+        reset_required = True
+    elif _whatsapp_credential_artifact_present(session_dir):
         print("✓ Existing WhatsApp session found")
         try:
             response = input(
@@ -3060,77 +3222,186 @@ def cmd_whatsapp(args):
         except (EOFError, KeyboardInterrupt):
             response = "n"
         if response.lower() in {"y", "yes"}:
-            shutil.rmtree(session_dir, ignore_errors=True)
-            session_dir.mkdir(parents=True, exist_ok=True)
-            print("  ✓ Session cleared")
+            reset_required = True
         else:
-            # Existing pairing — ensure WHATSAPP_ENABLED reflects that.
-            # (Older installs may have lost the env var; covers re-runs
-            # where the user picked "no, keep my session" but the var
-            # was never set or got removed.)
-            if (get_env_value("WHATSAPP_ENABLED") or "").lower() != "true":
-                save_env_value("WHATSAPP_ENABLED", "true")
-            print("\n✓ WhatsApp is configured and paired!")
-            print("  Start the gateway with: hermes gateway")
+            # Complete, non-revoked local credentials are already verified
+            # success. Preserve the established convenience behavior of
+            # restoring enablement when the user keeps that session. Partial
+            # credentials remain read-only and fail closed.
+            if _whatsapp_pairing_credentials_complete(session_dir):
+                try:
+                    save_env_value("WHATSAPP_ENABLED", "true")
+                except Exception:
+                    _print_whatsapp_enable_failed()
+                    return
+                print("\n✓ WhatsApp is configured and paired!")
+                print("  Start the gateway with: hermes gateway")
+            else:
+                print("\n  WhatsApp session is incomplete and was left unchanged.")
+                print("  Run `hermes whatsapp` again and choose re-pair.")
             return
 
-    # ── Step 6: QR code pairing ──────────────────────────────────────────
-    print()
-    print("─" * 50)
-    if wa_mode == "bot":
-        print("📱 Open WhatsApp (or WhatsApp Business) on the")
-        print("   phone with the BOT's number, then scan:")
-    else:
-        print("📱 Open WhatsApp on your phone, then scan:")
-    print()
-    print("   Settings → Linked Devices → Link a Device")
-    print("─" * 50)
-    print()
+    if not bridge_script.is_file():
+        _print_whatsapp_bridge_missing()
+        return
 
+    action = "re-pairing" if reset_required else "pairing"
     try:
-        subprocess.run(
-            [
-                find_node_executable("node") or "node",
-                str(bridge_script),
-                "--pair-only",
-                "--session",
-                str(session_dir),
-            ],
-            cwd=str(bridge_dir),
-            env=with_hermes_node_path(),
+        recovery_lease = acquire_whatsapp_recovery_lease(
+            session_dir,
+            bridge_script=bridge_script,
+            bridge_port=3000,
         )
-    except KeyboardInterrupt:
-        pass
+    except WhatsAppRecoveryError:
+        print(f"\n  ✗ The WhatsApp session is still in use; {action} was not started.")
+        print("    Stop the active WhatsApp bridge and try again.")
+        return
+
+    pairing_completed = False
+    lease_release_failed = False
+    try:
+        # Pairing and re-pairing are fail-closed operations. Persist the
+        # disabled state while the recovery lease is held and before either a
+        # destructive reset or child launch. If this write fails, the existing
+        # session remains untouched and no pair-only process is started.
+        try:
+            save_env_value("WHATSAPP_ENABLED", "false")
+        except Exception:
+            _print_whatsapp_disable_failed()
+            return
+
+        # Dependency mutation belongs to the same exclusive, disabled
+        # recovery attempt as reset and pairing. Never install merely because
+        # the user inspected and kept an already-complete session.
+        try:
+            dependencies_fresh = whatsapp_bridge_dependencies_fresh(bridge_dir)
+        except Exception:
+            dependencies_fresh = False
+        if not dependencies_fresh:
+            print(
+                "\n→ Installing WhatsApp bridge dependencies "
+                "(this can take a few minutes)..."
+            )
+            npm = find_node_executable("npm")
+            if not npm:
+                _print_whatsapp_dependency_install_failed()
+                return
+            try:
+                result = subprocess.run(
+                    [npm, "install", "--no-fund", "--no-audit", "--progress=false"],
+                    cwd=str(bridge_dir),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=with_hermes_node_path(),
+                )
+            except KeyboardInterrupt:
+                _print_whatsapp_dependency_install_failed()
+                return
+            except Exception:
+                _print_whatsapp_dependency_install_failed()
+                return
+            if result.returncode != 0:
+                _print_whatsapp_dependency_install_failed()
+                return
+            try:
+                write_whatsapp_bridge_dependency_stamp(bridge_dir)
+            except OSError:
+                pass
+            print("  ✓ Dependencies installed")
+        else:
+            print("✓ Bridge dependencies already installed")
+
+        if reset_required:
+            try:
+                recovery_lease.reset_session(session_dir)
+            except Exception:
+                # Continuing would pair on top of auth state that is still on
+                # disk — the thing clearing the session exists to prevent.
+                _print_session_clear_failed()
+                return
+            print("  ✓ Session cleared")
+
+        # ── Step 6: QR code pairing ─────────────────────────────────────────
+        _print_whatsapp_pairing_instructions(wa_mode)
+        pair_result: subprocess.CompletedProcess | None = None
+        node = find_node_executable("node")
+        try:
+            if node:
+                pair_result = subprocess.run(
+                    [
+                        node,
+                        str(bridge_script),
+                        "--pair-only",
+                        "--session",
+                        str(session_dir),
+                        "--port",
+                        "3000",
+                    ],
+                    cwd=str(bridge_dir),
+                    env=with_hermes_node_path(),
+                    **recovery_lease.pair_subprocess_kwargs(),
+                )
+        except KeyboardInterrupt:
+            pair_result = None
+        except Exception:
+            # Launch errors can contain absolute paths, errno text, or process
+            # details. The fixed post-pairing failure is sufficient and safe.
+            pair_result = None
+
+        if pair_result is not None and pair_result.returncode == 0:
+            try:
+                session_is_revoked_after_pairing = is_whatsapp_session_revoked(
+                    session_dir
+                )
+            except Exception:
+                # A verdict that cannot be inspected is not demonstrably safe.
+                session_is_revoked_after_pairing = True
+            pairing_completed = (
+                _whatsapp_pairing_credentials_complete(session_dir)
+                and session_is_revoked_after_pairing is False
+            )
+    finally:
+        try:
+            recovery_lease.release()
+        except Exception:
+            lease_release_failed = True
 
     # ── Step 7: Post-pairing ─────────────────────────────────────────────
     print()
-    if (session_dir / "creds.json").exists():
-        # Only enable WhatsApp now that pairing actually succeeded.  If the
-        # user Ctrl+C'd at any earlier step, WHATSAPP_ENABLED stays unset
-        # and `hermes gateway` skips it cleanly instead of paying a 30s
-        # bridge timeout + queueing the platform for indefinite retries.
+    if not pairing_completed or lease_release_failed:
+        _print_whatsapp_pairing_failed()
+        return
+
+    # Only enable WhatsApp after the pair-only child exits zero, complete
+    # local credentials exist, and marker inspection demonstrates that the
+    # session is not revoked. Every failed attempt remains disabled.
+    try:
         save_env_value("WHATSAPP_ENABLED", "true")
-        print("✓ WhatsApp paired successfully!")
+    except Exception:
+        _print_whatsapp_enable_failed()
+        return
+    print("✓ WhatsApp paired successfully!")
+    print()
+    if wa_mode == "bot":
+        print("  Next steps:")
+        print("    1. Start the gateway:  hermes gateway")
+        print("    2. Send a message to the bot's WhatsApp number")
+        print("    3. The agent will reply automatically")
         print()
-        if wa_mode == "bot":
-            print("  Next steps:")
-            print("    1. Start the gateway:  hermes gateway")
-            print("    2. Send a message to the bot's WhatsApp number")
-            print("    3. The agent will reply automatically")
-            print()
-            print("  Tip: Agent responses are prefixed with '⚕ Hermes Agent'")
-        else:
-            print("  Next steps:")
-            print("    1. Start the gateway:  hermes gateway")
-            print("    2. Open WhatsApp → Message Yourself")
-            print("    3. Type a message — the agent will reply")
-            print()
-            print("  Tip: Agent responses are prefixed with '⚕ Hermes Agent'")
-            print("  so you can tell them apart from your own messages.")
-        print()
-        print("  Or install as a service: hermes gateway install")
+        print("  Tip: Agent responses are prefixed with '⚕ Hermes Agent'")
     else:
-        print("⚠ Pairing may not have completed. Run 'hermes whatsapp' to try again.")
+        print("  Next steps:")
+        print("    1. Start the gateway:  hermes gateway")
+        print("    2. Open WhatsApp → Message Yourself")
+        print("    3. Type a message — the agent will reply")
+        print()
+        print("  Tip: Agent responses are prefixed with '⚕ Hermes Agent'")
+        print("  so you can tell them apart from your own messages.")
+    print()
+    print("  Or install as a service: hermes gateway install")
 
 
 def cmd_whatsapp_cloud(args):
