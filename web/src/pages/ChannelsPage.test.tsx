@@ -59,12 +59,12 @@ async function renderPage() {
   document.body.append(container);
   root = createRoot(container);
   await act(async () => root.render(<ChannelsPage />));
-  await vi.waitFor(() => expect(container.textContent).toContain("Pair with QR"));
+  await vi.waitFor(() => expect(container.textContent).toContain("Check WhatsApp session"));
 }
 
 async function clickPair() {
   const pairButton = Array.from(container.querySelectorAll("button")).find(
-    (button) => button.textContent?.trim() === "Pair with QR",
+    (button) => button.textContent?.trim() === "Check WhatsApp session",
   );
   expect(pairButton).toBeDefined();
   await act(async () => pairButton?.click());
@@ -88,7 +88,7 @@ afterEach(async () => {
 
 describe("WhatsApp revoked-session confirmation", () => {
   it("retries with destructive authorization only after confirmation", async () => {
-    const confirm = vi.fn(() => true);
+    const confirm = vi.fn((_: string): boolean => true);
     vi.stubGlobal("confirm", confirm);
     const start = vi
       .spyOn(api, "startWhatsAppOnboarding")

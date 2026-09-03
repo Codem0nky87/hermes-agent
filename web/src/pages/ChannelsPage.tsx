@@ -704,14 +704,12 @@ function WhatsAppOnboardingPanel({
           // that works.
           setError(status.error || WHATSAPP_REPAIR_REQUIRED_MESSAGE);
           setSetup(null);
-          setQrDataUrl("");
           setPhase("idle");
           return;
         }
         if (status.status === "error") {
           setError(status.error || "WhatsApp setup failed.");
           setSetup(null);
-          setQrDataUrl("");
           setPhase("idle");
           return;
         }
@@ -724,7 +722,6 @@ function WhatsAppOnboardingPanel({
           Number.isFinite(expiresAt) && Date.now() >= expiresAt;
         if (isTerminalWhatsAppOnboardingError(pollError) || expired) {
           setSetup(null);
-          setQrDataUrl("");
           setPhase("idle");
           setError("WhatsApp QR setup expired. Start a new QR setup to try again.");
           return;
@@ -749,7 +746,6 @@ function WhatsAppOnboardingPanel({
 
   const resetSetup = () => {
     setSetup(null);
-    setQrDataUrl("");
     setPhase("idle");
     setError("");
   };
@@ -757,7 +753,6 @@ function WhatsAppOnboardingPanel({
   const start = async (resetRevokedSession = false) => {
     setPhase("starting");
     setError("");
-    setQrDataUrl("");
     try {
       const res = await api.startWhatsAppOnboarding({
         mode,
@@ -769,7 +764,6 @@ function WhatsAppOnboardingPanel({
         // and never attempt to render a QR for it.
         setError(res.error || WHATSAPP_REPAIR_REQUIRED_MESSAGE);
         setSetup(null);
-        setQrDataUrl("");
         setPhase("idle");
         return;
       }
