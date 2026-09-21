@@ -50,6 +50,78 @@ async def test_critical_send_tagged_and_reask_after_resolve(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_promoted_held_question_is_not_worded_as_a_reask(tmp_path):
+    """Fix round 1, controller ruling: only a preempted question has been
+    seen before. A first delivery off the held queue is just a question."""
+    from gateway import run as run_mod
+
+    reg = QuestionRegistry(str(tmp_path / "q.db"))
+    out = _Sent()
+    first = await run_mod._send_question_gated(reg, out.send, task_ref="t1",
+                                               session_key="s1", body="deploy?")
+    held = await run_mod._send_question_gated(reg, out.send, task_ref="t2",
+                                              session_key="s2", body="rename?")
+    await run_mod._resolve_question_gated(reg, out.send, first.question_id)
+
+    assert len(out.messages) == 2
+    session_key, text = out.messages[1]
+    assert session_key == "s2"
+    assert text == f"[{held.question_id}] rename?"
+    assert "Re-asking" not in text
+
+
+@pytest.mark.asyncio
+async def test_send_that_never_lands_cancels_the_question(tmp_path):
+    """Fix round 1, I2: the id must survive a send that hangs or raises, or
+    the question can never be cancelled and holds the wire until its TTL."""
+    from gateway import run as run_mod
+
+    reg = QuestionRegistry(str(tmp_path / "q.db"))
+    out = _Sent()
+
+    def _hangs_then_times_out(_text):
+        raise TimeoutError("send future timed out")
+
+    question_id, sent_ok = run_mod._dispatch_gated_question(
+        reg, _hangs_then_times_out, task_ref="t1", session_key="s1",
+        body="deploy?")
+
+    assert question_id is not None and sent_ok is False
+    assert reg.pending() == question_id  # registered despite the failed send
+    await run_mod._cancel_question_gated(reg, out.send, question_id)
+    assert reg.pending() is None
+    assert reg.submit(task_ref="t2", session_key="s2",
+                      body="rename?").action == "send"
+
+    # A send that merely reports failure (no exception) behaves the same.
+    reg2 = QuestionRegistry(str(tmp_path / "q2.db"))
+    qid2, ok2 = run_mod._dispatch_gated_question(
+        reg2, lambda _text: False, task_ref="t1", session_key="s1", body="q")
+    assert qid2 is not None and ok2 is False
+    await run_mod._cancel_question_gated(reg2, out.send, qid2)
+    assert reg2.pending() is None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_sends_the_wire_text_and_holds_the_second(tmp_path):
+    from gateway import run as run_mod
+
+    reg = QuestionRegistry(str(tmp_path / "q.db"))
+    seen = []
+    first, ok = run_mod._dispatch_gated_question(
+        reg, lambda text: seen.append(text) or True,
+        task_ref="t1", session_key="s1", body="deploy?")
+    assert ok is True and seen == [f"[{first}] deploy?"]
+
+    second, ok2 = run_mod._dispatch_gated_question(
+        reg, lambda text: seen.append(text) or True,
+        task_ref="t2", session_key="s2", body="rename?")
+    # Held: nothing sent, but the caller still holds an id it can cancel.
+    assert ok2 is True and second is not None and len(seen) == 1
+    assert reg.held_ids() == [second]
+
+
+@pytest.mark.asyncio
 async def test_resolve_of_unknown_id_sends_nothing(tmp_path):
     from gateway import run as run_mod
 
@@ -144,7 +216,7 @@ async def test_resolving_a_reply_promotes_and_delivers_the_held_question(tmp_pat
         _event(f"{first.question_id} yes"), "owner")
 
     assert runner._question_registry.pending() == held.question_id
-    assert any("rename?" in text for text in sent)
+    assert sent == [f"[{held.question_id}] rename?"]  # first showing, not a re-ask
 
 
 @pytest.mark.asyncio
@@ -260,6 +332,37 @@ async def test_release_question_is_idempotent_after_a_text_answer(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_releasing_a_held_question_leaves_the_wire_alone(tmp_path):
+    """Fix round 1, I1: the question being released is not necessarily the
+    one on the wire. Retiring a held one must not promote a sibling over the
+    question the user is still looking at."""
+    runner, sent = _runner(tmp_path)
+
+    async def _sender(text):
+        sent.append(text)
+
+    for key in ("owner", "other", "third"):
+        runner._question_senders[key] = _sender
+    on_the_wire = runner._question_registry.submit(
+        task_ref="t1", session_key="owner", body="deploy?")
+    held = runner._question_registry.submit(
+        task_ref="t2", session_key="other", body="rename?")
+    also_held = runner._question_registry.submit(
+        task_ref="t3", session_key="third", body="delete?")
+
+    await runner._release_question(held.question_id)
+
+    assert runner._question_registry.pending() == on_the_wire.question_id
+    assert runner._question_registry.held_ids() == [also_held.question_id]
+    assert sent == []  # nothing new reached anyone
+
+    # Releasing the question that IS on the wire still promotes.
+    await runner._release_question(on_the_wire.question_id)
+    assert runner._question_registry.pending() == also_held.question_id
+    assert sent == [f"[{also_held.question_id}] delete?"]
+
+
+@pytest.mark.asyncio
 async def test_release_question_frees_the_wire_after_a_button_answer(tmp_path):
     """Buttons resolve the clarify without passing through _handle_message,
     so the agent-thread release is what frees the wire."""
@@ -345,3 +448,30 @@ def test_registry_is_built_only_when_whatsapp_is_enabled(tmp_path, monkeypatch):
         Platform.WHATSAPP: PlatformConfig(enabled=False),
     })
     assert disabled._question_registry is None
+
+
+def test_construction_reconciles_questions_left_by_a_dead_process(
+    tmp_path, monkeypatch,
+):
+    """Fix round 1, C1: the db outlives the process, the clarify waiters do
+    not. A restart must not inherit a pending question that holds the wire."""
+    from gateway.config import Platform, PlatformConfig
+    from gateway.question_registry import QuestionRegistry
+
+    db = tmp_path / "state" / "question_registry.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    before_restart = QuestionRegistry(str(db))
+    stranded = before_restart.submit(
+        task_ref="t1", session_key="owner", body="deploy?")
+    before_restart.submit(task_ref="t2", session_key="other", body="rename?")
+
+    runner = _runner_for_platforms(tmp_path, monkeypatch, {
+        Platform.WHATSAPP: PlatformConfig(enabled=True),
+    })
+
+    assert runner._question_registry.pending() is None
+    assert runner._question_registry.held_ids() == []
+    assert runner._question_registry.submit(
+        task_ref="t3", session_key="owner", body="fresh?").action == "send"
+    assert before_restart.route_reply(
+        f"{stranded.question_id} yes").status == "expired"

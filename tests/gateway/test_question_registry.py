@@ -139,6 +139,94 @@ def test_id_collision_exhausted_raises_clear_error(reg, monkeypatch):
         reg.submit(task_ref="t2", session_key="s2", body="q2")
 
 
+def test_reconcile_startup_frees_a_wire_inherited_from_a_dead_process(tmp_path):
+    # Fix round 1, C1: the db survives a restart but the clarify waiters do
+    # not, so an inherited pending row would hold the wire for its whole TTL.
+    db = str(tmp_path / "q7.db")
+    before = QuestionRegistry(db)
+    stranded = before.submit(task_ref="t1", session_key="s1", body="q1")
+    also_stranded = before.submit(task_ref="t2", session_key="s2", body="q2")
+
+    after_restart = QuestionRegistry(db)  # same file, new process
+    reconciled = after_restart.reconcile_startup()
+
+    assert sorted(reconciled) == sorted(
+        [stranded.question_id, also_stranded.question_id])
+    assert after_restart.pending() is None
+    assert after_restart.held_ids() == []
+    fresh = after_restart.submit(task_ref="t3", session_key="s3", body="q3")
+    assert fresh.action == "send"
+    # A late reply to an inherited question reports as expired, not routed.
+    assert after_restart.route_reply(f"{stranded.question_id} yes").status == "expired"
+
+
+def test_reconcile_startup_is_a_no_op_on_a_fresh_db(tmp_path):
+    reg = QuestionRegistry(str(tmp_path / "q8.db"))
+    assert reg.reconcile_startup() == []
+    assert reg.submit(task_ref="t1", session_key="s1", body="q").action == "send"
+
+
+def test_cancel_of_a_held_question_promotes_nothing(reg):
+    # Fix round 1, I1: a held question is not on the wire, so retiring it
+    # must not displace the question the user is actually looking at.
+    on_the_wire = reg.submit(task_ref="t1", session_key="s1", body="q1")
+    held = reg.submit(task_ref="t2", session_key="s2", body="q2")
+    also_held = reg.submit(task_ref="t3", session_key="s3", body="q3")
+
+    assert reg.cancel(held.question_id) is None
+    assert reg.pending() == on_the_wire.question_id
+    assert reg.held_ids() == [also_held.question_id]
+
+
+def test_cancel_of_the_pending_question_promotes_the_next(reg):
+    on_the_wire = reg.submit(task_ref="t1", session_key="s1", body="q1")
+    held = reg.submit(task_ref="t2", session_key="s2", body="q2")
+
+    nxt = reg.cancel(on_the_wire.question_id)
+
+    assert nxt is not None and nxt.question_id == held.question_id
+    assert nxt.was_preempted is False
+    assert reg.pending() == held.question_id
+
+
+def test_cancel_of_an_answered_question_is_a_no_op(reg):
+    a = reg.submit(task_ref="t1", session_key="s1", body="q1")
+    b = reg.submit(task_ref="t2", session_key="s2", body="q2")
+    reg.resolve(a.question_id)  # b is promoted
+    c = reg.submit(task_ref="t3", session_key="s3", body="q3")  # held
+
+    assert reg.cancel(a.question_id) is None
+    assert reg.pending() == b.question_id
+    assert reg.held_ids() == [c.question_id]
+    assert reg.cancel("D-ZZZ") is None
+
+
+def test_cancel_of_a_preempted_question_promotes_nothing(reg):
+    normal = reg.submit(task_ref="t1", session_key="s1", body="q1")
+    crit = reg.submit(task_ref="t9", session_key="s9", body="auth!",
+                      critical_class="auth_expiry")
+
+    assert reg.cancel(normal.question_id) is None
+    assert reg.pending() == crit.question_id
+
+
+def test_promotion_marks_only_preempted_questions_as_reasks(reg):
+    # Fix round 1, controller ruling: a question promoted off the held queue
+    # has never been shown, so it must not be worded as a re-ask.
+    first = reg.submit(task_ref="t1", session_key="s1", body="q1")
+    held = reg.submit(task_ref="t2", session_key="s2", body="q2")
+    promoted = reg.resolve(first.question_id)
+    assert promoted.question_id == held.question_id
+    assert promoted.was_preempted is False
+
+    crit = reg.submit(task_ref="t9", session_key="s9", body="auth!",
+                      critical_class="auth_expiry")
+    assert crit.preempted_id == held.question_id
+    reasked = reg.resolve(crit.question_id)
+    assert reasked.question_id == held.question_id
+    assert reasked.was_preempted is True
+
+
 def test_gentle_reask_once_at_half_ttl(tmp_path):
     clock = [0.0]
     reg = QuestionRegistry(str(tmp_path / "q4.db"), now=lambda: clock[0], default_ttl=100)

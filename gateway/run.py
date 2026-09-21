@@ -3509,6 +3509,12 @@ _QUESTION_EXPIRED_REPLY = (
 )
 
 
+def _question_wire_text(question_id, body, critical_class=None) -> str:
+    """The on-the-wire form of a question: its id, then the question."""
+    prefix = "[CRITICAL] " if critical_class else ""
+    return f"[{question_id}] {prefix}{body}"
+
+
 async def _send_question_gated(registry, send, *, task_ref, session_key,
                                body, critical_class=None):
     """Submit an outbound question and send it only if the wire is free."""
@@ -3516,20 +3522,73 @@ async def _send_question_gated(registry, send, *, task_ref, session_key,
                              body=body, critical_class=critical_class)
     if result.action == "hold":
         return result
-    prefix = "[CRITICAL] " if critical_class else ""
-    await send(session_key, f"[{result.question_id}] {prefix}{body}")
+    await send(session_key,
+               _question_wire_text(result.question_id, body, critical_class))
     return result
+
+
+def _dispatch_gated_question(registry, schedule_send, *, task_ref, session_key,
+                             body, critical_class=None):
+    """Submit a question, then (unless held) send it via ``schedule_send``.
+
+    Returns ``(question_id, sent_ok)``. The id comes from ``submit`` and is
+    returned even when the send hangs, times out, or raises — a registered
+    question whose id was lost could never be cancelled and would hold the
+    wire until its TTL. ``schedule_send`` is a *blocking* callable taking the
+    wire text and returning truthy on delivery; it exists so the agent's
+    worker thread can bridge to the gateway loop however it likes.
+    """
+    result = registry.submit(task_ref=task_ref, session_key=session_key,
+                             body=body, critical_class=critical_class)
+    question_id = result.question_id
+    if result.action == "hold":
+        return question_id, True
+    try:
+        sent = bool(schedule_send(
+            _question_wire_text(question_id, body, critical_class)))
+    except Exception as exc:
+        logger.error("Question %s could not be sent: %s", question_id, exc,
+                     exc_info=True)
+        return question_id, False
+    if not sent:
+        logger.error("Question %s was registered but not delivered",
+                     question_id)
+    return question_id, sent
+
+
+async def _deliver_promoted_question(send, reask) -> None:
+    """Send a question that has just taken the wire.
+
+    Only a question the user already saw — one a critical question pushed
+    aside — is worded as a re-ask. A question promoted straight off the held
+    queue is reaching them for the first time and reads as an ordinary
+    question.
+    """
+    if getattr(reask, "was_preempted", False):
+        text = (f"[{reask.question_id}] Re-asking — still pending from task "
+                f"{reask.task_ref}: {reask.body}")
+    else:
+        text = _question_wire_text(reask.question_id, reask.body)
+    await send(reask.session_key, text)
 
 
 async def _resolve_question_gated(registry, send, question_id):
     """Mark a question answered and deliver whatever the wire frees up."""
     reask = registry.resolve(question_id)
     if reask is not None:
-        await send(
-            reask.session_key,
-            f"[{reask.question_id}] Re-asking — still pending from task "
-            f"{reask.task_ref}: {reask.body}",
-        )
+        await _deliver_promoted_question(send, reask)
+    return reask
+
+
+async def _cancel_question_gated(registry, send, question_id):
+    """Retire a question nobody is waiting on any more.
+
+    Unlike ``_resolve_question_gated`` this promotes a successor ONLY when the
+    cancelled question was the one on the wire — see ``QuestionRegistry.cancel``.
+    """
+    reask = registry.cancel(question_id)
+    if reask is not None:
+        await _deliver_promoted_question(send, reask)
     return reask
 
 
@@ -5777,12 +5836,12 @@ class TurnRunner:
 
             # The registry (when live) decides whether this question goes out
             # now or waits for the wire. ``_delivery`` carries the real
-            # send_clarify result back out of the gated coroutine.
+            # send_clarify result back out of the scheduled coroutine.
             _registry = getattr(self._runner, "_question_registry", None)
             _question_id = None
             _delivery = {"ok": False}
 
-            async def _send_clarify_prompt(_session_key: str, text: str):
+            async def _send_clarify_prompt(text: str):
                 result = await ctx._status_adapter.send_clarify(
                     chat_id=ctx._status_chat_id,
                     question=text,
@@ -5794,9 +5853,25 @@ class TurnRunner:
                 _delivery["ok"] = bool(getattr(result, "success", False))
                 return result
 
+            def _schedule_clarify_send(text: str) -> bool:
+                """Run the send on the gateway loop and wait for its verdict."""
+                fut = safe_schedule_threadsafe(
+                    _send_clarify_prompt(text),
+                    ctx._loop_for_step,
+                    logger=logger,
+                    log_message="Clarify send failed to schedule",
+                )
+                if fut is None:
+                    return False
+                try:
+                    fut.result(timeout=15)
+                except Exception as exc:
+                    logger.warning("Clarify send failed: %s", exc)
+                    return False
+                return _delivery["ok"]
+
             if _registry is None:
-                _send_coro = _send_clarify_prompt(ctx.session_key or "", question)
-                _send_log = "Clarify send failed to schedule"
+                send_ok = _schedule_clarify_send(question)
             else:
                 # Capture the delivery target before the gate: a held
                 # question is sent from the sweep or from whichever turn
@@ -5806,47 +5881,27 @@ class TurnRunner:
                     ctx._status_adapter,
                     ctx._status_chat_id,
                 )
-                _send_coro = _send_question_gated(
+                # submit() runs here, on this thread, so the question id is in
+                # hand before anything is scheduled — a send that hangs past
+                # its 15s deadline must still leave the question cancellable.
+                _question_id, send_ok = _dispatch_gated_question(
                     _registry,
-                    _send_clarify_prompt,
+                    _schedule_clarify_send,
                     task_ref=(getattr(ctx, "session_id", None)
                               or ctx.session_key or "?"),
                     session_key=ctx.session_key or "",
                     body=question,
                 )
-                _send_log = "Gated clarify send failed to schedule"
-
-            send_ok = False
-            fut = safe_schedule_threadsafe(
-                _send_coro,
-                ctx._loop_for_step,
-                logger=logger,
-                log_message=_send_log,
-            )
-            if fut is None:
-                send_ok = False
-            else:
-                try:
-                    result = fut.result(timeout=15)
-                    if _registry is None:
-                        send_ok = _delivery["ok"]
-                    else:
-                        _question_id = getattr(result, "question_id", None)
-                        # A held question was accepted, just not shown yet —
-                        # keep waiting so it can still be answered when the
-                        # wire frees.
-                        send_ok = (
-                            True if getattr(result, "action", "") == "hold"
-                            else _delivery["ok"]
-                        )
-                except Exception as exc:
-                    logger.warning("Clarify send failed: %s", exc)
-                    send_ok = False
 
             if not send_ok:
                 # Couldn't deliver the prompt — clean up and return
                 # sentinel so the agent can fall back to a sensible
                 # default rather than hanging.
+                if _question_id is not None:
+                    logger.error(
+                        "Clarify prompt for question %s was not delivered; "
+                        "cancelling it so the wire stays free", _question_id,
+                    )
                 self._release_question_from_thread(_question_id, ctx._loop_for_step)
                 _clarify_mod.clear_session(ctx.session_key or "")
                 return "[clarify prompt could not be delivered]"
@@ -6709,6 +6764,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _q_db = _hermes_home / "state" / "question_registry.db"
                 _q_db.parent.mkdir(parents=True, exist_ok=True)
                 self._question_registry = QuestionRegistry(str(_q_db))
+                # The db outlives the process but the clarify waiters do not:
+                # a question inherited from a dead gateway can never be
+                # answered, and left pending it would hold the wire against
+                # every new question for the rest of its TTL.
+                _inherited = self._question_registry.reconcile_startup()
+                if _inherited:
+                    logger.info(
+                        "Question registry: expired %d question(s) inherited "
+                        "from a previous gateway process", len(_inherited),
+                    )
         except Exception:
             # A broken registry must never stop the gateway from starting:
             # without it, questions go out ungated exactly as they did before.
@@ -15349,20 +15414,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Free the wire for a question whose asker stopped waiting.
 
         Covers the paths that never reach ``_intercept_question_reply``: a
-        button/native-choice answer, a clarify timeout, and a session-boundary
-        cancellation. Skips questions that are no longer open so a release
-        racing the inbound text path cannot promote (and re-send) the next
-        held question twice.
+        button/native-choice answer, a clarify timeout, a send that never
+        landed, and a session-boundary cancellation.
+
+        Goes through ``cancel`` rather than ``resolve`` because the question
+        being released is not necessarily the one on the wire: releasing a
+        *held* question must retire it alone, while resolve would promote a
+        sibling over the question the user is still looking at. ``cancel`` is
+        also a no-op on already-answered ids, so a release racing the inbound
+        text path cannot re-send the next held question twice.
         """
         registry = getattr(self, "_question_registry", None)
         if registry is None or not question_id:
             return
         try:
-            if question_id != registry.pending() and (
-                question_id not in registry.held_ids()
-            ):
-                return
-            await _resolve_question_gated(
+            await _cancel_question_gated(
                 registry, self._send_question_text, question_id,
             )
         except Exception:

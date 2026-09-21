@@ -55,6 +55,11 @@ class ReaskInfo:
     task_ref: str
     session_key: str
     body: str
+    # True only when this question had already been sent and was pushed off
+    # the wire by a critical one — i.e. the user has seen it before and is
+    # being asked again. A question promoted straight from the held queue has
+    # never been shown, so it must not be worded as a re-ask.
+    was_preempted: bool = False
 
 
 @dataclass
@@ -174,6 +179,73 @@ class QuestionRegistry:
                 raise
         return nxt
 
+    def cancel(self, question_id: str) -> Optional[ReaskInfo]:
+        """Retire a question whose asker stopped waiting for an answer.
+
+        Only a ``pending`` question occupies the wire, so only cancelling one
+        of those may promote a successor — exactly as ``resolve`` does. A
+        ``held`` or ``preempted`` question is NOT on the wire: expiring it
+        must promote nothing, or a sibling would be pushed out alongside the
+        question the user is actually looking at. Any other status (already
+        answered or expired) is a no-op, which makes this safe to call from a
+        release path racing an inbound answer.
+        """
+        with _LOCK:
+            cur = self._db.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            nxt = None
+            try:
+                row = cur.execute(
+                    "SELECT status FROM questions WHERE question_id=?",
+                    (question_id,)).fetchone()
+                if row is None or row[0] not in ("pending", "held", "preempted"):
+                    self._db.commit()
+                    return None
+                was_on_the_wire = row[0] == "pending"
+                cur.execute(
+                    "UPDATE questions SET status='expired' WHERE question_id=?",
+                    (question_id,))
+                if was_on_the_wire:
+                    nxt = self._pick_next(cur)
+                    if nxt is not None:
+                        cur.execute(
+                            "UPDATE questions SET status='pending' "
+                            "WHERE question_id=?", (nxt.question_id,))
+                self._db.commit()
+            except BaseException:
+                self._db.rollback()
+                raise
+        return nxt
+
+    def reconcile_startup(self) -> List[str]:
+        """Expire every question left in flight by a previous process.
+
+        Questions are agent-session-bound: the waiter that would receive an
+        answer lives in the process that asked, and it does not survive a
+        restart. An inherited ``pending`` row can therefore never be answered,
+        and leaving it would hold the wire against every new question for the
+        rest of its TTL. Held and preempted rows are retired for the same
+        reason — their askers are gone too.
+        """
+        with _LOCK:
+            cur = self._db.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            try:
+                rows = cur.execute(
+                    "SELECT question_id FROM questions "
+                    "WHERE status IN ('pending','held','preempted')").fetchall()
+                ids = [r[0] for r in rows]
+                if ids:
+                    cur.executemany(
+                        "UPDATE questions SET status='expired' "
+                        "WHERE question_id=?",
+                        [(i,) for i in ids])
+                self._db.commit()
+            except BaseException:
+                self._db.rollback()
+                raise
+        return ids
+
     def route_reply(self, text: str) -> RouteResult:
         text = (text or "").strip()
         m = _ID_RE.match(text)
@@ -262,6 +334,7 @@ class QuestionRegistry:
             "SELECT question_id, task_ref, session_key, body FROM questions "
             "WHERE status='preempted' ORDER BY created_at DESC LIMIT 1"
         ).fetchone()
+        was_preempted = row is not None
         if row is None:
             held = cur.execute(
                 "SELECT question_id, task_ref, session_key, body, created_at "
@@ -282,4 +355,4 @@ class QuestionRegistry:
                     pass  # deterministic FIFO fallback
             by_id = {h[0]: h for h in held}
             row = by_id[order[0]][:4]
-        return ReaskInfo(row[0], row[1], row[2], row[3])
+        return ReaskInfo(row[0], row[1], row[2], row[3], was_preempted)
