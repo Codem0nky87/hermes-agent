@@ -1,8 +1,17 @@
 """Broker decisions ride the question registry: gated, critical-capable,
-broker-rejection surfaces to the owner."""
+broker-rejection surfaces to the owner, owner chat only."""
 import pytest
 
 from gateway.question_registry import QuestionRegistry
+
+OWNER = "s"
+
+
+async def _forward(run_mod, reg, send, routed, session_key=OWNER,
+                   owner=OWNER):
+    """Forward a routed reply as the owner chat unless told otherwise."""
+    return await run_mod._forward_broker_reply(
+        reg, send, routed, session_key=session_key, owner_session_key=owner)
 
 
 @pytest.mark.asyncio
@@ -13,6 +22,7 @@ async def test_poller_submits_broker_decisions_gated(tmp_path):
 
     async def send(sk, text):
         sent.append(text)
+        return True
 
     decisions = [{"decision_id": "abc", "question": "codex blocked: apply?",
                   "critical_class": None},
@@ -33,6 +43,7 @@ async def test_critical_broker_decision_preempts(tmp_path):
 
     async def send(sk, text):
         sent.append(text)
+        return True
 
     await run_mod._submit_broker_decisions(reg, send, "s", [
         {"decision_id": "n1", "question": "normal", "critical_class": None}])
@@ -52,6 +63,7 @@ async def test_unknown_critical_class_degrades_not_raises(tmp_path):
 
     async def send(sk, text):
         sent.append(text)
+        return True
 
     await run_mod._submit_broker_decisions(reg, send, "s", [
         {"decision_id": "x1", "question": "who knows",
@@ -67,6 +79,7 @@ async def test_malformed_decision_never_reaches_the_wire(tmp_path):
 
     async def send(sk, text):
         sent.append(text)
+        return True
 
     await run_mod._submit_broker_decisions(reg, send, "s", [
         {"decision_id": "", "question": "no id"},
@@ -85,6 +98,7 @@ async def test_broker_reply_forwarding_surfaces_rejection(tmp_path,
 
     async def send(sk, text):
         sent.append(text)
+        return True
 
     await run_mod._submit_broker_decisions(reg, send, "s", [
         {"decision_id": "abc", "question": "q?", "critical_class": None}])
@@ -93,7 +107,7 @@ async def test_broker_reply_forwarding_surfaces_rejection(tmp_path,
         run_mod, "_woodhouse_broker_call",
         lambda payload: {"ok": False, "error": "agent no longer blocked"})
     routed = reg.route_reply(f"{qid} 1")
-    out = await run_mod._forward_broker_reply(reg, send, routed)
+    out = await _forward(run_mod, reg, send, routed)
     assert out is True  # handled (not passed to clarify)
     assert any("no longer blocked" in t for t in sent)
 
@@ -107,6 +121,7 @@ async def test_broker_reply_forwarding_types_the_answer(tmp_path, monkeypatch):
 
     async def send(sk, text):
         sent.append(text)
+        return True
 
     await run_mod._submit_broker_decisions(reg, send, "s", [
         {"decision_id": "abc", "question": "q?", "critical_class": None},
@@ -119,8 +134,8 @@ async def test_broker_reply_forwarding_types_the_answer(tmp_path, monkeypatch):
         return {"ok": True}
 
     monkeypatch.setattr(run_mod, "_woodhouse_broker_call", fake_call)
-    assert await run_mod._forward_broker_reply(
-        reg, send, reg.route_reply(f"{qid} option 2")) is True
+    assert await _forward(
+        run_mod, reg, send, reg.route_reply(f"{qid} option 2")) is True
     assert calls == [{"method": "decision.submit",
                       "params": {"decision_id": "abc", "reply": "option 2"}}]
     # The wire is freed and the held decision takes its place.
@@ -136,12 +151,13 @@ async def test_non_broker_reply_is_left_for_clarify(tmp_path):
 
     async def send(sk, text):
         sent.append(text)
+        return True
 
     await run_mod._send_question_gated(reg, send, task_ref="task-42",
                                        session_key="s", body="deploy?")
     qid = reg.pending()
-    assert await run_mod._forward_broker_reply(
-        reg, send, reg.route_reply(f"{qid} yes")) is False
+    assert await _forward(
+        run_mod, reg, send, reg.route_reply(f"{qid} yes")) is False
     assert reg.pending() == qid  # untouched — clarify still owns it
 
 
@@ -154,6 +170,7 @@ async def test_unreachable_broker_is_reported_not_raised(tmp_path,
 
     async def send(sk, text):
         sent.append(text)
+        return True
 
     await run_mod._submit_broker_decisions(reg, send, "s", [
         {"decision_id": "abc", "question": "q?", "critical_class": None}])
@@ -163,8 +180,8 @@ async def test_unreachable_broker_is_reported_not_raised(tmp_path,
         raise OSError("no such socket")
 
     monkeypatch.setattr(run_mod, "_woodhouse_broker_call", boom)
-    assert await run_mod._forward_broker_reply(
-        reg, send, reg.route_reply(f"{qid} 1")) is True
+    assert await _forward(
+        run_mod, reg, send, reg.route_reply(f"{qid} 1")) is True
     assert any("broker unreachable" in t for t in sent)
 
 
@@ -233,3 +250,148 @@ def test_owner_session_key_prefers_config_then_sole_sender():
     runner._question_senders["other-chat"] = lambda t: None
     # Ambiguous without config: never guess which human owns the broker.
     assert key(runner, {}) == ""
+
+
+# --- Fix round 1 -------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_submitted_ids_are_returned_for_acknowledgement(tmp_path):
+    """I1: the poller acknowledges exactly the decisions the registry took
+    ownership of — held counts, undelivered does not."""
+    from gateway import run as run_mod
+    reg = QuestionRegistry(str(tmp_path / "q.db"))
+
+    async def send(sk, text):
+        return True
+
+    owned = await run_mod._submit_broker_decisions(reg, send, OWNER, [
+        {"decision_id": "d1", "question": "first", "critical_class": None},
+        {"decision_id": "d2", "question": "held", "critical_class": None}])
+    assert owned == ["d1", "d2"]  # d2 is held, still the registry's
+
+
+@pytest.mark.asyncio
+async def test_undelivered_question_never_jams_the_wire(tmp_path):
+    """I5: a typo'd owner_session_key must not leave a pending question
+    holding the one-question wire against every other question for 4h."""
+    from gateway import run as run_mod
+    reg = QuestionRegistry(str(tmp_path / "q.db"))
+
+    async def undeliverable(sk, text):
+        return False  # what _send_question_text reports with no sender
+
+    owned = await run_mod._submit_broker_decisions(reg, undeliverable,
+                                                   "typo-key", [
+        {"decision_id": "d1", "question": "nobody sees this",
+         "critical_class": None}])
+    assert owned == []                      # never acknowledged to the broker
+    assert reg.pending() is None            # wire is free
+    assert reg.held_ids() == []
+
+
+@pytest.mark.asyncio
+async def test_raising_send_also_leaves_no_pending_question(tmp_path):
+    from gateway import run as run_mod
+    reg = QuestionRegistry(str(tmp_path / "q.db"))
+
+    async def boom(sk, text):
+        raise RuntimeError("adapter is gone")
+
+    owned = await run_mod._submit_broker_decisions(reg, boom, OWNER, [
+        {"decision_id": "d1", "question": "q", "critical_class": None}])
+    assert owned == [] and reg.pending() is None
+
+
+@pytest.mark.asyncio
+async def test_send_question_text_reports_missing_sender():
+    """I5: the failure signal the cleanup above depends on."""
+    from gateway import run as run_mod
+
+    class _Runner:
+        _question_senders = {}
+
+    assert await run_mod.GatewayRunner._send_question_text(
+        _Runner(), "nobody", "text") is False
+
+    delivered = []
+
+    async def sender(text):
+        delivered.append(text)
+
+    _Runner._question_senders = {"chat": sender}
+    assert await run_mod.GatewayRunner._send_question_text(
+        _Runner(), "chat", "text") is True
+    assert delivered == ["text"]
+
+
+@pytest.mark.asyncio
+async def test_only_the_owner_chat_can_answer_a_decision(tmp_path,
+                                                         monkeypatch):
+    """I7: the registry lets any authorized session answer by explicit id —
+    right for a clarify question, wrong for keystrokes in a terminal."""
+    from gateway import run as run_mod
+    reg = QuestionRegistry(str(tmp_path / "q.db"))
+    sent = []
+
+    async def send(sk, text):
+        sent.append((sk, text))
+        return True
+
+    await run_mod._submit_broker_decisions(reg, send, OWNER, [
+        {"decision_id": "abc", "question": "q?", "critical_class": None}])
+    qid = reg.pending()
+
+    def never(payload):
+        raise AssertionError("broker called from a non-owner chat")
+
+    monkeypatch.setattr(run_mod, "_woodhouse_broker_call", never)
+    handled = await _forward(run_mod, reg, send, reg.route_reply(f"{qid} 1"),
+                             session_key="some-other-chat")
+    assert handled is True                    # consumed, never sent to clarify
+    assert reg.pending() == qid               # still answerable by the owner
+    assert sent[-1][0] == "some-other-chat"
+    assert "owner chat" in sent[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_owner_key_refuses_every_reply(tmp_path,
+                                                          monkeypatch):
+    from gateway import run as run_mod
+    reg = QuestionRegistry(str(tmp_path / "q.db"))
+    sent = []
+
+    async def send(sk, text):
+        sent.append(text)
+        return True
+
+    await run_mod._submit_broker_decisions(reg, send, OWNER, [
+        {"decision_id": "abc", "question": "q?", "critical_class": None}])
+    qid = reg.pending()
+
+    def never(payload):
+        raise AssertionError("broker called with no configured owner")
+
+    monkeypatch.setattr(run_mod, "_woodhouse_broker_call", never)
+    assert await _forward(run_mod, reg, send, reg.route_reply(f"{qid} 1"),
+                          owner="") is True
+    assert reg.pending() == qid
+
+
+def test_owner_key_must_have_a_registered_sender():
+    """I5: a configured key nobody can be reached at is no key at all."""
+    from gateway import run as run_mod
+
+    class _Runner:
+        _question_senders = {"wa:real": lambda t: None}
+
+    runner = _Runner()
+    key = run_mod.GatewayRunner._woodhouse_owner_session_key
+    assert key(runner, {"woodhouse": {"owner_session_key": "wa:typo"}}) == ""
+    assert key(runner, {"woodhouse": {"owner_session_key": "wa:real"}}) == \
+        "wa:real"
+    # Before any chat has asked a question there is nothing to check against;
+    # delivery failure then retires the question instead.
+    runner._question_senders = {}
+    assert key(runner, {"woodhouse": {"owner_session_key": "wa:real"}}) == \
+        "wa:real"

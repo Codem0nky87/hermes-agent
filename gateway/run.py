@@ -3703,10 +3703,17 @@ def _woodhouse_decision_poll_seconds(cfg: dict | None = None) -> float:
 
 
 async def _submit_broker_decisions(registry, send, session_key, decisions):
-    """Put each new broker decision on the question wire.
+    """Put each broker decision on the question wire.
 
     Gated exactly like every other outbound question: the first goes out,
-    the rest wait their turn. Returns the question ids in submit order.
+    the rest wait their turn. Returns the ids of the decisions the registry
+    now owns — the caller acknowledges exactly those to the broker.
+
+    Registration and delivery are kept in step by hand rather than through
+    ``_send_question_gated``: that helper registers the row before it sends
+    and cannot hand back the id when the send fails, so a bad owner session
+    key would leave a pending question holding the one-question wire — and
+    every other gateway question behind it — for its full 4h TTL.
     """
     from gateway.question_registry import CRITICAL_CLASSES
 
@@ -3729,32 +3736,68 @@ async def _submit_broker_decisions(registry, send, session_key, decisions):
             )
             critical = None
         try:
-            result = await _send_question_gated(
-                registry, send,
+            result = registry.submit(
                 task_ref=f"{_WOODHOUSE_BROKER_REF}{decision_id}",
                 session_key=session_key, body=body, critical_class=critical,
             )
         except Exception:
             # One bad decision must not cost the others their question.
-            logger.error("Broker decision %s could not be submitted",
+            logger.error("Broker decision %s could not be registered",
                          decision_id, exc_info=True)
             continue
-        submitted.append(result.question_id)
+        if result.action == "hold":
+            # Held is delivered-in-due-course: the registry owns it and will
+            # send it when the wire frees.
+            submitted.append(decision_id)
+            continue
+        delivered = False
+        try:
+            delivered = await send(
+                session_key,
+                _question_wire_text(result.question_id, body, critical),
+            ) is not False
+        except Exception:
+            logger.error("Broker decision %s could not be delivered to %s",
+                         decision_id, session_key, exc_info=True)
+        if not delivered:
+            # Undo the registration rather than leave a question nobody can
+            # see holding the wire. The broker keeps the decision open (it is
+            # never acknowledged), so the next tick offers it again.
+            logger.error(
+                "Broker decision %s was registered but not delivered to %s; "
+                "retiring question %s", decision_id, session_key,
+                result.question_id,
+            )
+            try:
+                await _cancel_question_gated(registry, send,
+                                             result.question_id)
+            except Exception:
+                logger.error("Could not retire undelivered question %s",
+                             result.question_id, exc_info=True)
+            continue
+        submitted.append(decision_id)
     return submitted
 
 
-async def _forward_broker_reply(registry, send, routed) -> bool:
+async def _forward_broker_reply(registry, send, routed, *, session_key,
+                                owner_session_key) -> bool:
     """Type a routed reply into the blocked agent it answers.
 
     Returns True when this reply was a broker decision's and has been
     handled here — the caller must NOT also hand it to clarify.
 
-    The broker is the one that decides whether the answer may be typed: it
-    re-checks that the agent is still blocked on the same prompt. A
-    rejection is reported verbatim to the owner and the question is retired
-    either way, because the decision it belonged to is closed at the broker
-    — a fresh one (with a fresh id and the current prompt) arrives on the
-    next poll if the agent is still stuck.
+    Only the owner chat may answer. The registry deliberately lets ANY
+    authorized session answer by explicit "[D-XXX]" id, which is right for a
+    task's clarify question and wrong here: this is the one path in the
+    system where a chat message becomes keystrokes in someone's terminal, so
+    design §15.3 requires the owner chat to match configuration.
+
+    The broker then decides whether the answer may actually be typed: it
+    re-checks that the agent is still blocked, in the same pane, on the same
+    prompt. A rejection is reported verbatim to the owner and the question is
+    retired either way, because the decision it belonged to is closed at the
+    broker — a fresh one (with a fresh id and the current prompt) arrives on
+    the next poll if the agent is still stuck.
     """
     ref = getattr(routed, "task_ref", "") or ""
     if not ref.startswith(_WOODHOUSE_BROKER_REF):
@@ -3763,8 +3806,23 @@ async def _forward_broker_reply(registry, send, routed) -> bool:
     if not answer:
         return False
     decision_id = ref[len(_WOODHOUSE_BROKER_REF):]
-    session_key = getattr(routed, "session_key", "") or ""
+    asked_in = getattr(routed, "session_key", "") or ""
     question_id = getattr(routed, "question_id", "") or ""
+    owner = owner_session_key or ""
+    if not owner or session_key != owner or asked_in != owner:
+        logger.error(
+            "Refusing broker decision %s answered from session %r (owner is "
+            "%r)", decision_id, session_key, owner or None,
+        )
+        try:
+            await send(session_key,
+                       f"[{question_id}] Decisions can only be answered from "
+                       f"the owner chat.")
+        except Exception:
+            logger.error("Could not report owner-chat refusal for %s",
+                         decision_id, exc_info=True)
+        # Deliberately left pending: the owner can still answer it.
+        return True
     try:
         result = await asyncio.to_thread(
             _woodhouse_broker_call,
@@ -15636,8 +15694,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         senders[session_key] = _send
 
-    async def _send_question_text(self, session_key: str, text: str) -> None:
-        """Deliver question text to the session that owns the question."""
+    async def _send_question_text(self, session_key: str, text: str) -> bool:
+        """Deliver question text to the session that owns the question.
+
+        Returns False when there was nobody to deliver to. Callers that
+        registered a question before sending it need that signal: a question
+        nobody can see must be retired, not left holding the one-question
+        wire for its whole TTL.
+        """
         sender = (getattr(self, "_question_senders", None) or {}).get(session_key)
         if sender is None:
             # Nothing to do but say so loudly: a promoted or re-asked
@@ -15647,8 +15711,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "No question sender registered for session %s; dropping "
                 "question text", session_key,
             )
-            return
+            return False
         await sender(text)
+        return True
 
     async def _release_question(self, question_id: Optional[str]) -> None:
         """Free the wire for a question whose asker stopped waiting.
@@ -15723,14 +15788,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # A Woodhouse broker decision is not a clarify question: nobody in
         # this process is waiting on it, and its answer is typed into
         # another machine's terminal pane. Short-circuit before clarify.
-        try:
-            if await _forward_broker_reply(registry, self._send_question_text,
-                                           route):
-                return ""
-        except Exception:
-            logger.error("Broker reply forwarding failed for question %s",
-                         route.question_id, exc_info=True)
-            return None
+        # Scoped to broker refs so the ordinary clarify path is untouched.
+        if (route.task_ref or "").startswith(_WOODHOUSE_BROKER_REF):
+            try:
+                owner_key = self._woodhouse_owner_session_key()
+            except Exception:
+                logger.error("Could not resolve the Woodhouse owner session "
+                             "key; refusing the reply", exc_info=True)
+                owner_key = ""
+            try:
+                await _forward_broker_reply(
+                    registry, self._send_question_text, route,
+                    session_key=session_key, owner_session_key=owner_key,
+                )
+            except Exception:
+                logger.error("Broker reply forwarding failed for question %s",
+                             route.question_id, exc_info=True)
+            # Consumed either way: a decision reply must never become an LLM
+            # turn. If it was not typed, the broker's decision stays open and
+            # is re-raised when it expires.
+            return ""
         try:
             from tools import clarify_gateway as _clarify_mod
         except Exception:
@@ -15800,9 +15877,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         cfg = cfg if cfg is not None else _load_gateway_runtime_config()
         configured = cfg_get(cfg, "woodhouse", "owner_session_key", default="")
-        if isinstance(configured, str) and configured:
-            return configured
         senders = getattr(self, "_question_senders", None) or {}
+        if isinstance(configured, str) and configured:
+            if senders and configured not in senders:
+                # A typo'd key cannot be delivered to. Say so rather than
+                # register questions the owner will never see.
+                logger.error(
+                    "woodhouse.owner_session_key %r has no registered "
+                    "question sender (known: %s)", configured, sorted(senders),
+                )
+                return ""
+            return configured
         if len(senders) == 1:
             return next(iter(senders))
         return ""
@@ -15846,10 +15931,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _woodhouse_broker_call, {"method": "decision.list"},
                         )
                         if isinstance(reply, dict) and reply.get("ok"):
-                            await _submit_broker_decisions(
+                            owned = await _submit_broker_decisions(
                                 registry, self._send_question_text,
                                 session_key, reply.get("decisions") or [],
                             )
+                            # Acknowledge only what the registry actually
+                            # owns. An unacknowledged decision is offered
+                            # again next tick, which is what makes a lost
+                            # or timed-out decision.list non-destructive.
+                            if owned:
+                                await asyncio.to_thread(
+                                    _woodhouse_broker_call,
+                                    {"method": "decision.ack",
+                                     "params": {"decision_ids": owned}},
+                                )
                         else:
                             logger.warning(
                                 "Broker decision.list failed: %s",
