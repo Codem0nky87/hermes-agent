@@ -139,6 +139,27 @@ def test_id_collision_exhausted_raises_clear_error(reg, monkeypatch):
         reg.submit(task_ref="t2", session_key="s2", body="q2")
 
 
+def test_gentle_reask_once_at_half_ttl(tmp_path):
+    clock = [0.0]
+    reg = QuestionRegistry(str(tmp_path / "q4.db"), now=lambda: clock[0], default_ttl=100)
+    a = reg.submit(task_ref="t1", session_key="s1", body="q")
+    assert reg.stale_for_reask() is None
+    clock[0] = 60
+    info = reg.stale_for_reask()
+    assert info is not None and info.question_id == a.question_id
+    assert reg.stale_for_reask() is None  # only one gentle re-ask
+
+
+def test_gentle_reask_skips_critical_questions(tmp_path):
+    clock = [0.0]
+    reg = QuestionRegistry(str(tmp_path / "q6.db"), now=lambda: clock[0], default_ttl=100)
+    reg.submit(task_ref="t9", session_key="s9", body="auth!",
+               critical_class="auth_expiry")
+    clock[0] = 60
+    # Critical prompts are already loud; the gentle nudge is for the rest.
+    assert reg.stale_for_reask() is None
+
+
 def test_concurrent_expire_stale_no_transaction_errors(tmp_path):
     # Fix round 1, finding 1: expire_stale does its own read-modify-write
     # (SELECT stale ids, then UPDATE them) and must be lock-guarded like

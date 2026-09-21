@@ -3498,6 +3498,41 @@ def _build_inbound_coalescer(cfg: dict, dispatch):
     )
 
 
+# --- pending-question registry (amendment spec 2026-09-21 §3) -------------
+# One non-critical question on the wire at a time. Outbound questions are
+# submitted to the registry, which answers "send" or "hold"; every sent
+# question carries its "[D-XXX]" id so a reply can be routed back to the
+# session that asked it, even from a different chat.
+
+_QUESTION_EXPIRED_REPLY = (
+    "That decision expired — the task will re-ask if still needed."
+)
+
+
+async def _send_question_gated(registry, send, *, task_ref, session_key,
+                               body, critical_class=None):
+    """Submit an outbound question and send it only if the wire is free."""
+    result = registry.submit(task_ref=task_ref, session_key=session_key,
+                             body=body, critical_class=critical_class)
+    if result.action == "hold":
+        return result
+    prefix = "[CRITICAL] " if critical_class else ""
+    await send(session_key, f"[{result.question_id}] {prefix}{body}")
+    return result
+
+
+async def _resolve_question_gated(registry, send, question_id):
+    """Mark a question answered and deliver whatever the wire frees up."""
+    reask = registry.resolve(question_id)
+    if reask is not None:
+        await send(
+            reask.session_key,
+            f"[{reask.question_id}] Re-asking — still pending from task "
+            f"{reask.task_ref}: {reask.body}",
+        )
+    return reask
+
+
 def _resolve_gateway_model(config: dict | None = None) -> str:
     """Read model from config.yaml — single source of truth.
 
@@ -4042,6 +4077,21 @@ class TurnRunner:
     def __init__(self, runner: "GatewayRunner", ctx: TurnContext) -> None:
         self._runner = runner
         self._ctx = ctx
+
+    def _release_question_from_thread(self, question_id, loop) -> None:
+        """Free a gated question's wire slot from the agent's worker thread.
+
+        Fire-and-forget: ``_release_question`` swallows its own failures, and
+        the agent thread must not block on registry bookkeeping.
+        """
+        if not question_id:
+            return
+        safe_schedule_threadsafe(
+            self._runner._release_question(question_id),
+            loop,
+            logger=logger,
+            log_message="Question release failed to schedule",
+        )
 
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
@@ -5725,26 +5775,70 @@ class TurnRunner:
                     exc_info=True,
                 )
 
-            send_ok = False
-            fut = safe_schedule_threadsafe(
-                ctx._status_adapter.send_clarify(
+            # The registry (when live) decides whether this question goes out
+            # now or waits for the wire. ``_delivery`` carries the real
+            # send_clarify result back out of the gated coroutine.
+            _registry = getattr(self._runner, "_question_registry", None)
+            _question_id = None
+            _delivery = {"ok": False}
+
+            async def _send_clarify_prompt(_session_key: str, text: str):
+                result = await ctx._status_adapter.send_clarify(
                     chat_id=ctx._status_chat_id,
-                    question=question,
+                    question=text,
                     choices=list(choices) if choices else None,
                     clarify_id=clarify_id,
                     session_key=ctx.session_key or "",
                     metadata=ctx._status_thread_metadata,
-                ),
+                )
+                _delivery["ok"] = bool(getattr(result, "success", False))
+                return result
+
+            if _registry is None:
+                _send_coro = _send_clarify_prompt(ctx.session_key or "", question)
+                _send_log = "Clarify send failed to schedule"
+            else:
+                # Capture the delivery target before the gate: a held
+                # question is sent from the sweep or from whichever turn
+                # frees the wire, long after this one has moved on.
+                self._runner._register_question_sender(
+                    ctx.session_key or "",
+                    ctx._status_adapter,
+                    ctx._status_chat_id,
+                )
+                _send_coro = _send_question_gated(
+                    _registry,
+                    _send_clarify_prompt,
+                    task_ref=(getattr(ctx, "session_id", None)
+                              or ctx.session_key or "?"),
+                    session_key=ctx.session_key or "",
+                    body=question,
+                )
+                _send_log = "Gated clarify send failed to schedule"
+
+            send_ok = False
+            fut = safe_schedule_threadsafe(
+                _send_coro,
                 ctx._loop_for_step,
                 logger=logger,
-                log_message="Clarify send failed to schedule",
+                log_message=_send_log,
             )
             if fut is None:
                 send_ok = False
             else:
                 try:
                     result = fut.result(timeout=15)
-                    send_ok = bool(getattr(result, "success", False))
+                    if _registry is None:
+                        send_ok = _delivery["ok"]
+                    else:
+                        _question_id = getattr(result, "question_id", None)
+                        # A held question was accepted, just not shown yet —
+                        # keep waiting so it can still be answered when the
+                        # wire frees.
+                        send_ok = (
+                            True if getattr(result, "action", "") == "hold"
+                            else _delivery["ok"]
+                        )
                 except Exception as exc:
                     logger.warning("Clarify send failed: %s", exc)
                     send_ok = False
@@ -5753,11 +5847,17 @@ class TurnRunner:
                 # Couldn't deliver the prompt — clean up and return
                 # sentinel so the agent can fall back to a sensible
                 # default rather than hanging.
+                self._release_question_from_thread(_question_id, ctx._loop_for_step)
                 _clarify_mod.clear_session(ctx.session_key or "")
                 return "[clarify prompt could not be delivered]"
 
             timeout = _clarify_mod.get_clarify_timeout()
             response = _clarify_mod.wait_for_response(clarify_id, timeout=float(timeout))
+            # However this wait ended — button answer, typed answer, timeout,
+            # session-boundary cancellation — this question is no longer
+            # waiting on the user, so free the wire for the next one. No-ops
+            # when the inbound path already resolved it.
+            self._release_question_from_thread(_question_id, ctx._loop_for_step)
             if response is None or response == "":
                 # Timeout or session-boundary cancellation
                 return f"[user did not respond within {int(timeout / 60)}m]"
@@ -6591,6 +6691,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # handlers call this facade and await every operation.
         self._async_session_store = AsyncSessionStore(self.session_store)
         self.delivery_router = DeliveryRouter(self.config)
+        # Pending-question registry (amendment spec §3): one non-critical
+        # question on the wire at a time, replies routed back by "[D-XXX]"
+        # id. WhatsApp-gated — it exists to tame a phone's single linear
+        # thread, and every other platform keeps today's behaviour exactly.
+        # session_key -> "send this text to that chat" closure, captured when
+        # a question is asked so a held one can still be delivered later.
+        self._question_senders: Dict[str, Callable[[str], Awaitable[None]]] = {}
+        self._question_registry = None
+        try:
+            _wa_cfg = (getattr(self.config, "platforms", None) or {}).get(
+                Platform.WHATSAPP
+            )
+            if _wa_cfg is not None and getattr(_wa_cfg, "enabled", True):
+                from gateway.question_registry import QuestionRegistry
+
+                _q_db = _hermes_home / "state" / "question_registry.db"
+                _q_db.parent.mkdir(parents=True, exist_ok=True)
+                self._question_registry = QuestionRegistry(str(_q_db))
+        except Exception:
+            # A broken registry must never stop the gateway from starting:
+            # without it, questions go out ungated exactly as they did before.
+            logger.error("Question registry unavailable; questions will be "
+                         "sent ungated", exc_info=True)
+            self._question_registry = None
         self._running = False
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutdown_event = asyncio.Event()
@@ -12751,6 +12875,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Start background session expiry watcher to finalize expired sessions
         self._spawn_supervised(self._session_expiry_watcher, "session_expiry_watcher")
 
+        # Pending-question sweep: expire questions nobody answered and send
+        # one gentle nudge at half-TTL. Only when the registry is live.
+        if getattr(self, "_question_registry", None) is not None:
+            self._spawn_supervised(
+                self._question_registry_watcher, "question_registry_watcher",
+            )
+
         # Stall watchdog: pending inbound + stale agent activity → warn user
         # to /new (does not kill the turn; see agent.session_stall_timeout).
         self._spawn_supervised(self._session_stall_watcher, "session_stall_watcher")
@@ -15177,6 +15308,169 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         return self._coalescing_message_handler(self._handle_message)
 
+    # --- pending-question registry ---------------------------------------
+    # Outbound side lives in the clarify callback (TurnRunner.run_sync); the
+    # helpers below are the runner-side plumbing it and the inbound path
+    # share: who a question can be re-delivered to, how a reply is routed
+    # back by id, and how the wire is freed when a question stops mattering.
+
+    def _register_question_sender(self, session_key: str, adapter, chat_id) -> None:
+        """Remember how to reach *session_key* with a later question.
+
+        A held question is delivered when the wire frees — possibly minutes
+        after the turn that asked it — so the delivery target is captured
+        here, at ask time, while the adapter and chat id are still in hand.
+        """
+        senders = getattr(self, "_question_senders", None)
+        if senders is None:
+            senders = {}
+            self._question_senders = senders
+
+        async def _send(text: str) -> None:
+            await adapter.send(chat_id, text)
+
+        senders[session_key] = _send
+
+    async def _send_question_text(self, session_key: str, text: str) -> None:
+        """Deliver question text to the session that owns the question."""
+        sender = (getattr(self, "_question_senders", None) or {}).get(session_key)
+        if sender is None:
+            # Nothing to do but say so loudly: a promoted or re-asked
+            # question that cannot be delivered is a question the user will
+            # never see, while its task keeps waiting.
+            logger.error(
+                "No question sender registered for session %s; dropping "
+                "question text", session_key,
+            )
+            return
+        await sender(text)
+
+    async def _release_question(self, question_id: Optional[str]) -> None:
+        """Free the wire for a question whose asker stopped waiting.
+
+        Covers the paths that never reach ``_intercept_question_reply``: a
+        button/native-choice answer, a clarify timeout, and a session-boundary
+        cancellation. Skips questions that are no longer open so a release
+        racing the inbound text path cannot promote (and re-send) the next
+        held question twice.
+        """
+        registry = getattr(self, "_question_registry", None)
+        if registry is None or not question_id:
+            return
+        try:
+            if question_id != registry.pending() and (
+                question_id not in registry.held_ids()
+            ):
+                return
+            await _resolve_question_gated(
+                registry, self._send_question_text, question_id,
+            )
+        except Exception:
+            logger.error("Failed to release question %s", question_id,
+                         exc_info=True)
+
+    async def _intercept_question_reply(
+        self, event, session_key: str,
+    ) -> Optional[str]:
+        """Route an inbound message that answers a registry-tracked question.
+
+        Returns ``""`` when the message was consumed as an answer (no LLM
+        turn), the expiry notice when it answers a dead question, or ``None``
+        to continue normal dispatch untouched.
+
+        Runs on the dispatched (post-coalescing) event, so a reply split
+        across WhatsApp messages — "D-XXX" then "2" — is routed from the
+        merged text rather than from the first fragment alone.
+        """
+        registry = getattr(self, "_question_registry", None)
+        if registry is None:
+            return None
+        if not getattr(event, "allow_gateway_control", True):
+            return None
+        text = (getattr(event, "text", "") or "").strip()
+        # Slash commands are commands, never answers — same rule the clarify
+        # and slash-confirm intercepts below already follow.
+        if not text or text.startswith("/"):
+            return None
+        try:
+            route = registry.route_reply(text)
+        except Exception:
+            logger.error("Question reply routing failed", exc_info=True)
+            return None
+        if route.status == "expired":
+            logger.info(
+                "Reply to expired question %s from session %s",
+                route.question_id, session_key,
+            )
+            return _QUESTION_EXPIRED_REPLY
+        if route.status != "routed":
+            # "unmatched" (no id, nothing pending) and "ambiguous" (an id is
+            # required to disambiguate) both fall through unchanged.
+            return None
+        # Only an explicit id may answer across sessions. A bare reply is
+        # routed by the registry purely because one question happens to be on
+        # the wire, which would let an unrelated message in another chat
+        # answer someone else's open-ended prompt.
+        explicit_id = bool(route.question_id) and text.startswith(route.question_id)
+        if not explicit_id and (route.session_key or "") != session_key:
+            return None
+        try:
+            from tools import clarify_gateway as _clarify_mod
+        except Exception:
+            return None
+        answer = (route.remainder or "").strip()
+        if not answer:
+            return None
+        try:
+            outcome = _clarify_mod.attempt_text_response_for_session(
+                route.session_key or "", answer,
+            )
+        except Exception:
+            logger.error("Question reply delivery failed", exc_info=True)
+            return None
+        if outcome != _clarify_mod.TEXT_RESOLVED:
+            # Rejected prose / invalid selection / no waiting clarify: leave
+            # the question on the wire and let the existing per-session
+            # clarify intercept (and normal dispatch) handle the message.
+            return None
+        logger.info(
+            "Routed reply to question %s (task=%s, owner session=%s)",
+            route.question_id, route.task_ref, route.session_key,
+        )
+        try:
+            await _resolve_question_gated(
+                registry, self._send_question_text, route.question_id,
+            )
+        except Exception:
+            # The waiting agent already has the answer — a bookkeeping
+            # failure must not also turn that answer into a fresh LLM turn.
+            logger.error("Failed to resolve answered question %s",
+                         route.question_id, exc_info=True)
+        return ""
+
+    async def _question_registry_watcher(self, interval: float = 60.0) -> None:
+        """Expire stale questions and send one gentle nudge at half-TTL."""
+        await asyncio.sleep(30)  # initial delay — let the gateway settle
+        while self._running:
+            try:
+                registry = getattr(self, "_question_registry", None)
+                if registry is not None:
+                    expired = registry.expire_stale()
+                    if expired:
+                        logger.info(
+                            "Question registry: expired %d stale question(s)",
+                            len(expired),
+                        )
+                    info = registry.stale_for_reask()
+                    if info is not None:
+                        await self._send_question_text(
+                            info.session_key,
+                            f"[{info.question_id}] Still pending: {info.body}",
+                        )
+            except Exception:
+                logger.error("Question registry sweep failed", exc_info=True)
+            await asyncio.sleep(interval)
+
     async def _handle_gateway_platform_event(self, event: dict, source) -> None:
         """Authorize and publish one normalized adapter event to plugin hooks."""
         try:
@@ -16357,6 +16651,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         e,
                     )
                 _up_state.persistent.update_prompt_pending = False
+
+        # Intercept replies to a registry-tracked question ("[D-XXX] yes").
+        # Placed ahead of the per-session clarify intercept because a
+        # question id routes ACROSS sessions — the answer may arrive in a
+        # different chat than the task that asked it — and because resolving
+        # here is what frees the wire for the next held question. Anything it
+        # does not consume falls through to the existing intercepts unchanged.
+        _question_reply = await self._intercept_question_reply(event, _quick_key)
+        if _question_reply is not None:
+            return _question_reply
 
         # Intercept messages that are responses to a pending clarify.
         # Open-ended prompts and "Other" responses are captured as free text;

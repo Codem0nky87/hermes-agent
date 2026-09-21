@@ -77,6 +77,10 @@ class QuestionRegistry:
         self._now = now
         self._ttl = default_ttl
         self._scorer: Optional[Callable[[List[dict]], List[str]]] = None
+        # Question ids that already had their one gentle half-TTL nudge.
+        # Process-local by design: a gateway restart is allowed to nudge
+        # once more rather than stay silent about a question it re-adopts.
+        self._reasked: set[str] = set()
         self._db = sqlite3.connect(db_path, check_same_thread=False)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute(
@@ -219,6 +223,27 @@ class QuestionRegistry:
                 self._db.rollback()
                 raise
         return ids
+
+    def stale_for_reask(self) -> Optional[ReaskInfo]:
+        """One gentle re-ask at half-TTL: return the pending question that has
+        been quiet past default_ttl/2 and has not been re-asked yet.
+
+        Read-mostly, but the ``_reasked`` bookkeeping is a read-modify-write —
+        two sweeps racing here would both claim the same question and send two
+        nudges — so it takes the same lock as submit/resolve/expire_stale.
+        """
+        now = self._now()
+        with _LOCK:
+            row = self._db.execute(
+                "SELECT question_id, task_ref, session_key, body, created_at "
+                "FROM questions WHERE status='pending' AND critical_class IS NULL"
+            ).fetchone()
+            if row is None or now - row[4] < self._ttl / 2:
+                return None
+            if row[0] in self._reasked:
+                return None
+            self._reasked.add(row[0])
+        return ReaskInfo(row[0], row[1], row[2], row[3])
 
     def pending(self) -> Optional[str]:
         row = self._db.execute(
