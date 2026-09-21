@@ -3475,6 +3475,7 @@ def _load_gateway_runtime_config() -> dict:
 _COALESCE_DISPATCH_ATTR = "_hermes_coalesced_dispatch"  # re-injected merged turn
 _COALESCE_INLINE_ATTR = "_hermes_coalesce_inline"       # dispatch inline, not via ingress
 _COALESCE_RESULT_ATTR = "_hermes_coalesce_result"       # inline handler's response
+_COALESCE_OWNED_ATTR = "_hermes_coalesce_owned"         # coalescer took the message
 
 
 def _coalesce_applies(cfg: dict, platform_name: str) -> bool:
@@ -15088,9 +15089,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         of returning a response string nobody is left waiting for.
 
         Dispatches the coalescer makes *synchronously* from ``submit`` (slash
-        commands, windows disabled, max-window overflow) stay on the original
-        inline path so command handling — including the bridge ``/attach``
-        batch protocol — is byte-identical to the un-coalesced gateway.
+        commands, a window disabled for that message's class, max-window
+        overflow) stay on the original inline path so command handling —
+        including the bridge ``/attach`` batch protocol — is byte-identical to
+        the un-coalesced gateway.
         """
         async def _dispatch(event) -> None:
             if getattr(event, _COALESCE_INLINE_ATTR, False):
@@ -15099,6 +15101,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             setattr(event, _COALESCE_DISPATCH_ATTR, True)
             adapter = self._adapter_for_source(getattr(event, "source", None))
             if adapter is None or not hasattr(adapter, "handle_message"):
+                # Re-injection exists precisely so the merged turn's reply
+                # travels the adapter's normal send path. Without an adapter
+                # there is nothing to send it, so the reply IS lost — say so
+                # loudly, then still run the handler so the work itself (tool
+                # calls, session state) is not silently dropped too.
+                logger.error(
+                    "inbound coalescer: no adapter for %s — merged turn will be "
+                    "processed but its reply cannot be delivered",
+                    getattr(getattr(event, "source", None), "chat_id", "<unknown>"),
+                )
                 await handler(event)
                 return
             await adapter.handle_message(event)
@@ -15109,8 +15121,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if await self._submit_to_inbound_coalescer(event, _dispatch):
                         return getattr(event, _COALESCE_RESULT_ATTR, None)
                 except Exception:
-                    logger.debug(
-                        "inbound coalescer submit failed; dispatching directly",
+                    if getattr(event, _COALESCE_OWNED_ATTR, False):
+                        # The coalescer already had the message: the wrapped
+                        # handler may have run (inline slash-command dispatch)
+                        # or the event may have been merged and flushed.
+                        # Re-dispatching here would repeat side effects such as
+                        # /new or /approve, so surface the failure the way an
+                        # un-coalesced handler failure surfaces instead.
+                        logger.error(
+                            "inbound coalescer: dispatch failed after the message "
+                            "was handed over; not re-dispatching",
+                            exc_info=True,
+                        )
+                        raise
+                    logger.error(
+                        "inbound coalescer: submit failed before the message was "
+                        "handed over; dispatching directly",
                         exc_info=True,
                     )
             return await handler(event)
@@ -15128,9 +15154,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if coalescer is None:
             coalescer = _build_inbound_coalescer(cfg, dispatch)
             self._inbound_coalescer = coalescer
+        # Everything that can fail *without* the coalescer touching the message
+        # happens above this line, so ``_COALESCE_OWNED_ATTR`` marks the exact
+        # point past which a retry would risk double-processing.
+        key = self._session_key_for_source(source)
+        setattr(event, _COALESCE_OWNED_ATTR, True)
         setattr(event, _COALESCE_INLINE_ATTR, True)
         try:
-            await coalescer.submit(self._session_key_for_source(source), event)
+            await coalescer.submit(key, event)
         finally:
             # Cleared once submit returns so a *later* timer flush of this
             # same event (it is the merge base) re-injects instead of running

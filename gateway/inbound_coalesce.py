@@ -5,6 +5,13 @@ same chat inside the window merge into one combined turn. A bare
 attachment whose window expires with no follow-up gets MEDIA_ONLY_NOTE
 appended so the agent asks instead of guessing. Slash commands bypass;
 stop-class commands also drop held work for that chat.
+
+Windows disable per class: ``text_window=0`` means a text message opens no
+window of its own and dispatches immediately *when nothing is held for that
+chat* — but it still merges into an already-open window. That is how the
+WhatsApp config runs, because the adapter there already batches text on its
+own 5s quiet period and a second gateway-side text window would only stack
+latency onto it.
 """
 from __future__ import annotations
 
@@ -58,18 +65,26 @@ class InboundCoalescer:
                 self._drop(key)
             await self._dispatch(event)
             return
-        if self._disabled():
-            await self._dispatch(event)
-            return
-
         loop = asyncio.get_running_loop()
         held = self._held.get(key)
         if held is None:
             window = self._window_for(event)
+            if window <= 0.0:
+                # Per-window disable: this class of message opens no window of
+                # its own, so with nothing already held for this chat it goes
+                # straight through. Used for text on WhatsApp, where the
+                # adapter already applies its own 5s quiet-period batching and
+                # a second gateway-side window would just stack latency.
+                await self._dispatch(event)
+                return
             timer = loop.call_later(window, self._flush_soon, key)
             self._held[key] = _Held(event, timer)
             return
 
+        # A window IS open for this chat: merge regardless of the arriving
+        # message's own window setting. This is what keeps the caption case
+        # working with text_window=0 — media opens the media window, and the
+        # caption that follows still joins that turn instead of racing it.
         held.events.append(event)
         held.timer.cancel()
         elapsed = time.monotonic() - held.first_at
@@ -81,10 +96,8 @@ class InboundCoalescer:
             held.timer = loop.call_later(window, self._flush_soon, key)
 
     # -- internals --------------------------------------------------------
-    def _disabled(self) -> bool:
-        return self._text_window <= 0 and self._media_window <= 0
-
     def _window_for(self, event: Any) -> float:
+        """Opening window for *event*; ``<= 0`` disables holding for its class."""
         has_media = bool(getattr(event, "media_urls", None))
         has_text = bool((getattr(event, "text", "") or "").strip())
         if has_media and not has_text:

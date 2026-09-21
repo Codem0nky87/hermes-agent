@@ -150,3 +150,46 @@ async def test_timer_flush_dispatch_failure_is_logged_and_state_recovers(caplog)
     await asyncio.sleep(0.15)
     assert len(calls) == 2
     assert calls[1].text == "second"
+
+
+# --- fix round 1: per-window disable semantics ----------------------------
+# The WhatsApp adapter already batches text on its own 5s quiet period
+# (plugins/platforms/whatsapp/adapter.py), so the gateway runs with
+# text_window=0. A zero window must only mean "open no window of my own" —
+# an already-open window still collects the fragment.
+
+
+@pytest.mark.asyncio
+async def test_zero_text_window_dispatches_text_immediately():
+    out = []
+    c = _coalescer(out, text_window=0, media_window=0.1)
+    await c.submit("chat1", _ev(text="hi"))
+    await asyncio.sleep(0)  # no window wait
+    assert [e.text for e in out] == ["hi"]
+    assert c._held == {}  # nothing left holding the chat
+
+
+@pytest.mark.asyncio
+async def test_zero_text_window_still_merges_into_an_open_media_window():
+    out = []
+    c = _coalescer(out, text_window=0, media_window=0.2)
+    await c.submit("chat1", _ev(media=["/tmp/img.jpg"]))
+    await asyncio.sleep(0.02)
+    assert out == []  # media window is open and holding
+    await c.submit("chat1", _ev(text="resize this to 512px"))
+    await asyncio.sleep(0.05)
+    assert len(out) == 1  # the caption joined the held attachment
+    assert out[0].media_urls == ["/tmp/img.jpg"]
+    assert "resize this to 512px" in out[0].text
+
+
+@pytest.mark.asyncio
+async def test_media_window_still_holds_when_text_window_is_zero():
+    out = []
+    c = _coalescer(out, text_window=0, media_window=0.15)
+    await c.submit("chat1", _ev(media=["/tmp/img.jpg"]))
+    await asyncio.sleep(0.05)
+    assert out == []  # still inside the media window
+    await asyncio.sleep(0.2)
+    assert len(out) == 1
+    assert MEDIA_ONLY_NOTE in out[0].text

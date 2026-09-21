@@ -50,7 +50,7 @@ def _event(text="", platform=Platform.WHATSAPP, media=None):
     return event
 
 
-def _runner(monkeypatch, handled, injected):
+def _runner(monkeypatch, handled, injected, *, raises=None, adapter=True):
     from gateway import run as run_mod
     from gateway.run import GatewayRunner
 
@@ -65,11 +65,14 @@ def _runner(monkeypatch, handled, injected):
 
     async def _handle_message(event):
         handled.append(event)
+        if raises is not None:
+            raise raises
         return "reply"
 
+    _adapter = _Adapter() if adapter else None
     runner._handle_message = _handle_message  # type: ignore[method-assign]
     runner._session_key_for_source = lambda source: "wa:c1"  # type: ignore[method-assign]
-    runner._adapter_for_source = lambda source: _Adapter()  # type: ignore[method-assign]
+    runner._adapter_for_source = lambda source: _adapter  # type: ignore[method-assign]
     return runner
 
 
@@ -113,3 +116,79 @@ async def test_unlisted_platform_bypasses_the_coalescer(monkeypatch):
     assert await handler(_event(text="hi", platform=Platform.DISCORD)) == "reply"
     assert len(handled) == 1
     assert injected == []
+
+
+# --- fix round 1 ----------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_failing_inline_command_handler_is_not_re_dispatched(monkeypatch, caplog):
+    """A raising slash-command handler must run exactly once.
+
+    The inline dispatch happens *inside* ``submit()``, so a handler failure
+    surfaces as an exception out of the submit call. Retrying there would
+    repeat side effects like /new or /approve.
+    """
+    import logging
+
+    handled, injected = [], []
+    handler = _runner(
+        monkeypatch, handled, injected, raises=RuntimeError("boom")
+    )._primary_message_handler()
+
+    with caplog.at_level(logging.ERROR, logger="gateway.run"):
+        with pytest.raises(RuntimeError, match="boom"):
+            await handler(_event(text="/new"))
+
+    assert len(handled) == 1  # ran once, not twice
+    assert injected == []
+    assert any(
+        "after the message was handed over" in r.message and r.levelno == logging.ERROR
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_failure_before_handover_still_dispatches_directly(monkeypatch, caplog):
+    """A failure with the message still un-handed-over falls back safely."""
+    import logging
+
+    handled, injected = [], []
+    runner = _runner(monkeypatch, handled, injected)
+
+    def _boom(source):
+        raise RuntimeError("no session key")
+
+    runner._session_key_for_source = _boom  # type: ignore[method-assign]
+    handler = runner._primary_message_handler()
+
+    with caplog.at_level(logging.ERROR, logger="gateway.run"):
+        assert await handler(_event(text="hello")) == "reply"
+
+    assert len(handled) == 1  # dispatched directly, exactly once
+    assert any(
+        "before the message was handed over" in r.message and r.levelno == logging.ERROR
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_missing_adapter_logs_error_and_still_processes(monkeypatch, caplog):
+    """No adapter ⇒ the reply cannot be delivered; say so, but still process."""
+    import logging
+
+    handled, injected = [], []
+    handler = _runner(
+        monkeypatch, handled, injected, adapter=False
+    )._primary_message_handler()
+
+    assert await handler(_event(media=["/tmp/a.jpg"])) is None
+    with caplog.at_level(logging.ERROR, logger="gateway.run"):
+        await asyncio.sleep(0.25)
+
+    assert injected == []
+    assert len(handled) == 1  # work not dropped
+    assert any(
+        "reply cannot be delivered" in r.message and r.levelno == logging.ERROR
+        for r in caplog.records
+    )
