@@ -6774,6 +6774,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "Question registry: expired %d question(s) inherited "
                         "from a previous gateway process", len(_inherited),
                     )
+                # Jev advisory ordering of the held queue (amendment spec
+                # §4.4): config-gated, defaults on. The gateway reads raw
+                # YAML rather than the GatewayConfig dataclass (jev is not a
+                # modeled field) — same _load_gateway_runtime_config()/cfg_get
+                # accessor pattern the other __init__ config reads above use.
+                # Wiring is isolated in its own try: a Jev-specific failure
+                # (bad config, import error) must not fall through to the
+                # outer except and tear down the question registry that just
+                # constructed successfully — it should simply leave the
+                # registry unscored (FIFO). Runtime scorer failures are
+                # already handled independently inside QuestionRegistry
+                # itself (None/exception from the scorer → FIFO fallback).
+                try:
+                    _jev_cfg = _load_gateway_runtime_config()
+                    if cfg_get(_jev_cfg, "jev", "enabled", default=True):
+                        from agent.jev_client import JevClient
+
+                        self._question_registry.set_scorer(
+                            JevClient(
+                                model=cfg_get(
+                                    _jev_cfg, "jev", "model_pin",
+                                    default="jev-1.13.0",
+                                )
+                            ).score_held_questions
+                        )
+                except Exception:
+                    logger.error(
+                        "Jev scorer unavailable; held questions will use "
+                        "FIFO ordering", exc_info=True,
+                    )
         except Exception:
             # A broken registry must never stop the gateway from starting:
             # without it, questions go out ungated exactly as they did before.

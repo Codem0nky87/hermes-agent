@@ -130,6 +130,18 @@ def _default_transport(base_url: str, api_key: str, timeout: float):
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
+                # jev-ai.pro sits behind Cloudflare, which blocks urllib's
+                # default "Python-urllib/x.y" User-Agent as a bot signature
+                # (Cloudflare error 1010) before the request ever reaches the
+                # API — every real call would 403 and silently degrade to
+                # fallback, masking the whole feature. Confirmed live: same
+                # request 403s without this header, 200s with it.
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0 Safari/537.36"
+                ),
+                "Accept": "application/json",
             },
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
