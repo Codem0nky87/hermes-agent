@@ -98,3 +98,75 @@ def test_scorer_orders_held_queue(reg):
     reg.set_scorer(lambda feats: [c.question_id, b.question_id])
     nxt = reg.resolve(a.question_id)
     assert nxt.question_id == c.question_id
+
+
+def test_reply_to_answered_id_gets_expired_status(reg):
+    # Fix round 1, finding 3: an answered id must not route to an agent
+    # again — it reports the same "expired" status as a TTL-expired id.
+    a = reg.submit(task_ref="t1", session_key="s1", body="q1")
+    reg.resolve(a.question_id)
+    r = reg.route_reply(f"{a.question_id} thanks")
+    assert r.status == "expired"
+    assert r.question_id == a.question_id
+
+
+def test_id_collision_retries_with_new_id(reg, monkeypatch):
+    # Fix round 1, finding 2: a colliding candidate id must not surface an
+    # uncaught sqlite3.IntegrityError from submit() — it should retry with
+    # a fresh id and succeed.
+    ids = iter(["D-AAA", "D-AAA", "D-BBB"])
+    monkeypatch.setattr(
+        "gateway.question_registry._new_id", lambda: next(ids)
+    )
+    first = reg.submit(task_ref="t1", session_key="s1", body="q1")
+    assert first.question_id == "D-AAA"
+    second = reg.submit(task_ref="t2", session_key="s2", body="q2")
+    assert second.question_id == "D-BBB"
+    assert second.action == "hold"
+
+
+def test_id_collision_exhausted_raises_clear_error(reg, monkeypatch):
+    # If every attempt collides, submit() must fail loudly (not silently
+    # drop the question or raise a raw sqlite3.IntegrityError).
+    monkeypatch.setattr(
+        "gateway.question_registry._new_id", lambda: "D-AAA"
+    )
+    first = reg.submit(task_ref="t1", session_key="s1", body="q1")
+    assert first.question_id == "D-AAA"
+    # Every subsequent candidate is still "D-AAA", which now already
+    # exists, so all _MAX_ID_ATTEMPTS retries collide.
+    with pytest.raises(RuntimeError):
+        reg.submit(task_ref="t2", session_key="s2", body="q2")
+
+
+def test_concurrent_expire_stale_no_transaction_errors(tmp_path):
+    # Fix round 1, finding 1: expire_stale does its own read-modify-write
+    # (SELECT stale ids, then UPDATE them) and must be lock-guarded like
+    # submit/resolve, or concurrent callers hit sqlite3.OperationalError
+    # ("cannot start a transaction within a transaction").
+    clock = [1000.0]
+    reg2 = QuestionRegistry(str(tmp_path / "q5.db"), now=lambda: clock[0],
+                             default_ttl=10)
+    for i in range(8):
+        reg2.submit(task_ref=f"t{i}", session_key=f"s{i}", body="q")
+    clock[0] += 20  # every question (pending + held) is now stale
+    errors = []
+    results = []
+
+    def worker():
+        try:
+            results.append(reg2.expire_stale())
+        except Exception as exc:  # pragma: no cover - failure path
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+    # Every question must end up expired exactly once, regardless of how
+    # the eight expire_stale() calls interleaved.
+    assert sorted(qid for batch in results for qid in batch) == sorted(
+        set(qid for batch in results for qid in batch)
+    )

@@ -21,17 +21,25 @@ CRITICAL_CLASSES = frozenset(
 
 _ID_RE = re.compile(r"^(D-[A-Z2-9]{3})\b\s*(.*)$", re.DOTALL)
 _ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+_MAX_ID_ATTEMPTS = 5
 
-# Guards the submit/resolve transactions. The sqlite connection is opened
-# with check_same_thread=False so multiple gateway threads can share one
-# QuestionRegistry instance; BEGIN IMMEDIATE alone still races under
-# concurrent threads on a single connection (sqlite3's own implicit
-# transaction handling can raise "cannot start a transaction within a
-# transaction" when two threads interleave statements on one connection),
-# so this lock serializes access at the Python level. The sqlite
-# transaction is kept too — it still matters if this module is ever used
-# from multiple processes against the same db file.
+# Guards the submit/resolve/expire_stale transactions — every method that
+# does a read-modify-write against the questions table. The sqlite
+# connection is opened with check_same_thread=False so multiple gateway
+# threads can share one QuestionRegistry instance; BEGIN IMMEDIATE alone
+# still races under concurrent threads on a single connection (sqlite3's
+# own implicit transaction handling can raise "cannot start a transaction
+# within a transaction" when two threads interleave statements on one
+# connection), so this lock serializes access at the Python level. The
+# sqlite transaction is kept too — it still matters if this module is
+# ever used from multiple processes against the same db file.
 _LOCK = threading.Lock()
+
+
+def _new_id() -> str:
+    """Generate a candidate D-XXX question id. Module-level so tests can
+    monkeypatch it to force id collisions deterministically."""
+    return "D-" + "".join(secrets.choice(_ALPHABET) for _ in range(3))
 
 
 @dataclass
@@ -93,7 +101,6 @@ class QuestionRegistry:
                critical_class: Optional[str] = None) -> SubmitResult:
         if critical_class is not None and critical_class not in CRITICAL_CLASSES:
             raise ValueError(f"unknown critical class: {critical_class!r}")
-        qid = "D-" + "".join(secrets.choice(_ALPHABET) for _ in range(3))
         now = self._now()
         with _LOCK:
             cur = self._db.cursor()
@@ -118,11 +125,26 @@ class QuestionRegistry:
                     ).fetchone()
                     action = "hold" if busy else "send"
                     status = "held" if busy else "pending"
-                cur.execute(
-                    "INSERT INTO questions VALUES (?,?,?,?,?,?,?,?)",
-                    (qid, task_ref, session_key, body, critical_class, status,
-                     now, now + self._ttl),
-                )
+                qid = None
+                last_exc: Optional[BaseException] = None
+                for _ in range(_MAX_ID_ATTEMPTS):
+                    candidate = _new_id()
+                    try:
+                        cur.execute(
+                            "INSERT INTO questions VALUES (?,?,?,?,?,?,?,?)",
+                            (candidate, task_ref, session_key, body,
+                             critical_class, status, now, now + self._ttl),
+                        )
+                        qid = candidate
+                        break
+                    except sqlite3.IntegrityError as exc:
+                        last_exc = exc
+                        continue
+                if qid is None:
+                    raise RuntimeError(
+                        f"question id space exhausted: {_MAX_ID_ATTEMPTS} "
+                        "consecutive id collisions"
+                    ) from last_exc
                 self._db.commit()
             except BaseException:
                 self._db.rollback()
@@ -159,7 +181,10 @@ class QuestionRegistry:
             if row is None:
                 return RouteResult("unmatched", None, None, None, text)
             task_ref, session_key, status = row
-            if status == "expired":
+            if status in ("expired", "answered"):
+                # An answered question is functionally expired for replies:
+                # it already resolved, its slot may have been reassigned,
+                # and a late reply must not reach an agent a second time.
                 return RouteResult("expired", qid, task_ref, session_key, remainder)
             return RouteResult("routed", qid, task_ref, session_key, remainder)
         rows = self._db.execute(
@@ -174,16 +199,25 @@ class QuestionRegistry:
 
     def expire_stale(self) -> List[str]:
         now = self._now()
-        rows = self._db.execute(
-            "SELECT question_id FROM questions "
-            "WHERE status IN ('pending','held','preempted') AND expires_at < ?",
-            (now,)).fetchall()
-        ids = [r[0] for r in rows]
-        if ids:
-            self._db.executemany(
-                "UPDATE questions SET status='expired' WHERE question_id=?",
-                [(i,) for i in ids])
-            self._db.commit()
+        with _LOCK:
+            cur = self._db.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            try:
+                rows = cur.execute(
+                    "SELECT question_id FROM questions "
+                    "WHERE status IN ('pending','held','preempted') "
+                    "AND expires_at < ?",
+                    (now,)).fetchall()
+                ids = [r[0] for r in rows]
+                if ids:
+                    cur.executemany(
+                        "UPDATE questions SET status='expired' "
+                        "WHERE question_id=?",
+                        [(i,) for i in ids])
+                self._db.commit()
+            except BaseException:
+                self._db.rollback()
+                raise
         return ids
 
     def pending(self) -> Optional[str]:
