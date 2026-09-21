@@ -3470,6 +3470,33 @@ def _load_gateway_runtime_config() -> dict:
     return expanded if isinstance(expanded, dict) else {}
 
 
+# Per-event markers used to steer one inbound message through the coalescer
+# without changing MessageEvent's public shape.
+_COALESCE_DISPATCH_ATTR = "_hermes_coalesced_dispatch"  # re-injected merged turn
+_COALESCE_INLINE_ATTR = "_hermes_coalesce_inline"       # dispatch inline, not via ingress
+_COALESCE_RESULT_ATTR = "_hermes_coalesce_result"       # inline handler's response
+
+
+def _coalesce_applies(cfg: dict, platform_name: str) -> bool:
+    """True when inbound burst coalescing is enabled for *platform_name*."""
+    section = (cfg.get("gateway") or {}).get("inbound_coalesce") or {}
+    platforms = section.get("platforms", ["whatsapp"])
+    return platform_name in platforms
+
+
+def _build_inbound_coalescer(cfg: dict, dispatch):
+    """Build the process-wide inbound coalescer from ``gateway.inbound_coalesce``."""
+    from gateway.inbound_coalesce import InboundCoalescer
+
+    section = (cfg.get("gateway") or {}).get("inbound_coalesce") or {}
+    return InboundCoalescer(
+        dispatch,
+        text_window=float(section.get("text_window", 4.0)),
+        media_window=float(section.get("media_window", 8.0)),
+        max_window=float(section.get("max", 10.0)),
+    )
+
+
 def _resolve_gateway_model(config: dict | None = None) -> str:
     """Read model from config.yaml — single source of truth.
 
@@ -15050,11 +15077,74 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return _handler
 
+    def _coalescing_message_handler(self, handler):
+        """Wrap a primary handler so inbound bursts merge into one turn.
+
+        A held fragment is released later by the coalescer's timer, outside
+        the adapter task that first received it, so the merged event is
+        re-injected through ``adapter.handle_message`` — the same ingress a
+        freshly received message uses. That keeps reply delivery, MEDIA:
+        extraction and the active-session guard on their normal path instead
+        of returning a response string nobody is left waiting for.
+
+        Dispatches the coalescer makes *synchronously* from ``submit`` (slash
+        commands, windows disabled, max-window overflow) stay on the original
+        inline path so command handling — including the bridge ``/attach``
+        batch protocol — is byte-identical to the un-coalesced gateway.
+        """
+        async def _dispatch(event) -> None:
+            if getattr(event, _COALESCE_INLINE_ATTR, False):
+                setattr(event, _COALESCE_RESULT_ATTR, await handler(event))
+                return
+            setattr(event, _COALESCE_DISPATCH_ATTR, True)
+            adapter = self._adapter_for_source(getattr(event, "source", None))
+            if adapter is None or not hasattr(adapter, "handle_message"):
+                await handler(event)
+                return
+            await adapter.handle_message(event)
+
+        async def _handler(event):
+            if not getattr(event, _COALESCE_DISPATCH_ATTR, False):
+                try:
+                    if await self._submit_to_inbound_coalescer(event, _dispatch):
+                        return getattr(event, _COALESCE_RESULT_ATTR, None)
+                except Exception:
+                    logger.debug(
+                        "inbound coalescer submit failed; dispatching directly",
+                        exc_info=True,
+                    )
+            return await handler(event)
+
+        return _handler
+
+    async def _submit_to_inbound_coalescer(self, event, dispatch) -> bool:
+        """Hand *event* to the process-wide coalescer; False ⇒ dispatch now."""
+        source = getattr(event, "source", None)
+        platform = getattr(getattr(source, "platform", None), "value", "")
+        cfg = _load_gateway_runtime_config()
+        if source is None or not platform or not _coalesce_applies(cfg, platform):
+            return False
+        coalescer = getattr(self, "_inbound_coalescer", None)
+        if coalescer is None:
+            coalescer = _build_inbound_coalescer(cfg, dispatch)
+            self._inbound_coalescer = coalescer
+        setattr(event, _COALESCE_INLINE_ATTR, True)
+        try:
+            await coalescer.submit(self._session_key_for_source(source), event)
+        finally:
+            # Cleared once submit returns so a *later* timer flush of this
+            # same event (it is the merge base) re-injects instead of running
+            # inline and losing its reply.
+            setattr(event, _COALESCE_INLINE_ATTR, False)
+        return True
+
     def _primary_message_handler(self):
         """Return the correctly scoped handler for a primary adapter."""
         if getattr(self.config, "multiplex_profiles", False):
-            return self._make_default_profile_message_handler()
-        return self._handle_message
+            return self._coalescing_message_handler(
+                self._make_default_profile_message_handler()
+            )
+        return self._coalescing_message_handler(self._handle_message)
 
     async def _handle_gateway_platform_event(self, event: dict, source) -> None:
         """Authorize and publish one normalized adapter event to plugin hooks."""
