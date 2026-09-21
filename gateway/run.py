@@ -3609,6 +3609,193 @@ async def _cancel_question_gated(registry, send, question_id):
     return reask
 
 
+# --- Woodhouse broker decision relay (Wave 2-3 plan, Task 8) -------------
+# A blocked Herdr agent is a question with nobody to ask. The broker raises
+# a Decision for it; the relay below puts that decision on the SAME single
+# question wire everything else uses, so a phone's one linear thread never
+# carries two open questions at once. Replies route back by "[D-XXX]" id
+# like any other answer, and reach the agent's pane only if the broker can
+# still prove that agent is blocked on the same prompt it asked about.
+#
+# Everything here is OFF unless `woodhouse.decision_poll_seconds` is set.
+
+_WOODHOUSE_PLUGIN_SLUG = "woodhouse-orchestration"
+# The plugin manager imports directory plugins as hermes_plugins.<slug with
+# dashes as underscores>, optionally suffixed per Hermes home.
+_WOODHOUSE_MODULE_PREFIX = "hermes_plugins.woodhouse_orchestration"
+_WOODHOUSE_BROKER_REF = "broker:"
+_WOODHOUSE_DEFAULT_SOCKET = "~/.woodhouse/broker.sock"
+
+
+def _woodhouse_plugin_module():
+    """Return the woodhouse-orchestration plugin module, or ``None``.
+
+    Prefers the copy the plugin manager already imported — that is the live
+    one, carrying the live socket path — and falls back to loading the
+    bundled source by path so the relay also works before/without the
+    manager. Import is lazy and failure is ``None``: a gateway on an
+    install without the plugin must start and run exactly as before.
+    """
+    for name, module in list(sys.modules.items()):
+        if name.startswith(_WOODHOUSE_MODULE_PREFIX) and hasattr(
+            module, "_broker_call"
+        ):
+            return module
+    init_file = (
+        Path(__file__).resolve().parents[1]
+        / "plugins" / _WOODHOUSE_PLUGIN_SLUG / "__init__.py"
+    )
+    if not init_file.exists():
+        return None
+    try:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "woodhouse_orchestration", init_file,
+        )
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception:
+        logger.error("Woodhouse plugin could not be imported", exc_info=True)
+        return None
+
+
+def _woodhouse_broker_call(payload: dict) -> dict:
+    """One broker round trip. BLOCKING — always call via ``to_thread``.
+
+    Module-level by design: the socket contract (one request per
+    connection, bounded timeout) lives in the plugin, and tests replace
+    this single name rather than the socket.
+    """
+    module = _woodhouse_plugin_module()
+    if module is None:
+        return {"ok": False, "error": "woodhouse plugin unavailable"}
+    return module._broker_call(payload)
+
+
+def _woodhouse_broker_socket_ready() -> bool:
+    """True when the broker's socket actually exists on disk.
+
+    Cheap pre-flight so a poll on a machine with no broker running is a
+    stat() rather than a connect-and-fail every tick.
+    """
+    module = _woodhouse_plugin_module()
+    sock = getattr(module, "_BROKER_SOCK", None) or _WOODHOUSE_DEFAULT_SOCKET
+    try:
+        return os.path.exists(os.path.expanduser(sock))
+    except Exception:
+        return False
+
+
+def _woodhouse_decision_poll_seconds(cfg: dict | None = None) -> float:
+    """Poll cadence from config; ``0`` (the default) disables the relay."""
+    cfg = cfg if cfg is not None else _load_gateway_runtime_config()
+    try:
+        return float(
+            cfg_get(cfg, "woodhouse", "decision_poll_seconds", default=0) or 0
+        )
+    except (TypeError, ValueError):
+        logger.error("Invalid woodhouse.decision_poll_seconds; relay disabled")
+        return 0.0
+
+
+async def _submit_broker_decisions(registry, send, session_key, decisions):
+    """Put each new broker decision on the question wire.
+
+    Gated exactly like every other outbound question: the first goes out,
+    the rest wait their turn. Returns the question ids in submit order.
+    """
+    from gateway.question_registry import CRITICAL_CLASSES
+
+    submitted = []
+    for decision in decisions or []:
+        decision = decision if isinstance(decision, dict) else {}
+        decision_id = str(decision.get("decision_id") or "")
+        body = str(decision.get("question") or "").strip()
+        if not decision_id or not body:
+            logger.error("Ignoring malformed broker decision: %r", decision)
+            continue
+        critical = decision.get("critical_class") or None
+        if critical is not None and critical not in CRITICAL_CLASSES:
+            # The broker is a separate process on its own release cadence.
+            # An unknown class must degrade to an ordinary question — never
+            # raise out of the poll, which is what registry.submit would do.
+            logger.error(
+                "Unknown critical class %r on broker decision %s; sending it "
+                "as a normal question", critical, decision_id,
+            )
+            critical = None
+        try:
+            result = await _send_question_gated(
+                registry, send,
+                task_ref=f"{_WOODHOUSE_BROKER_REF}{decision_id}",
+                session_key=session_key, body=body, critical_class=critical,
+            )
+        except Exception:
+            # One bad decision must not cost the others their question.
+            logger.error("Broker decision %s could not be submitted",
+                         decision_id, exc_info=True)
+            continue
+        submitted.append(result.question_id)
+    return submitted
+
+
+async def _forward_broker_reply(registry, send, routed) -> bool:
+    """Type a routed reply into the blocked agent it answers.
+
+    Returns True when this reply was a broker decision's and has been
+    handled here — the caller must NOT also hand it to clarify.
+
+    The broker is the one that decides whether the answer may be typed: it
+    re-checks that the agent is still blocked on the same prompt. A
+    rejection is reported verbatim to the owner and the question is retired
+    either way, because the decision it belonged to is closed at the broker
+    — a fresh one (with a fresh id and the current prompt) arrives on the
+    next poll if the agent is still stuck.
+    """
+    ref = getattr(routed, "task_ref", "") or ""
+    if not ref.startswith(_WOODHOUSE_BROKER_REF):
+        return False
+    answer = (getattr(routed, "remainder", "") or "").strip()
+    if not answer:
+        return False
+    decision_id = ref[len(_WOODHOUSE_BROKER_REF):]
+    session_key = getattr(routed, "session_key", "") or ""
+    question_id = getattr(routed, "question_id", "") or ""
+    try:
+        result = await asyncio.to_thread(
+            _woodhouse_broker_call,
+            {"method": "decision.submit",
+             "params": {"decision_id": decision_id, "reply": answer}},
+        )
+    except Exception as exc:
+        logger.error("Broker decision.submit failed for %s", decision_id,
+                     exc_info=True)
+        result = {"ok": False, "error": f"broker unreachable: {exc}"}
+    if not isinstance(result, dict) or not result.get("ok"):
+        error = "broker rejected the reply"
+        if isinstance(result, dict) and result.get("error"):
+            error = str(result["error"])
+        logger.info("Broker refused decision %s: %s", decision_id, error)
+        try:
+            await send(session_key, f"[{question_id}] Not delivered: {error}")
+        except Exception:
+            logger.error("Could not report broker rejection for %s",
+                         decision_id, exc_info=True)
+    else:
+        logger.info("Typed routed reply into broker decision %s", decision_id)
+    try:
+        # Free the wire either way: nobody can answer this question again.
+        await _cancel_question_gated(registry, send, question_id)
+    except Exception:
+        logger.error("Failed to retire answered broker question %s",
+                     question_id, exc_info=True)
+    return True
+
+
 def _resolve_gateway_model(config: dict | None = None) -> str:
     """Read model from config.yaml — single source of truth.
 
@@ -12993,6 +13180,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._spawn_supervised(
                 self._question_registry_watcher, "question_registry_watcher",
             )
+            # Woodhouse broker decisions ride that same wire. Config-gated
+            # and off by default — the watcher returns immediately (and is
+            # never respawned) unless woodhouse.decision_poll_seconds is set.
+            self._spawn_supervised(
+                self._poll_broker_decisions, "woodhouse_decision_poller",
+            )
 
         # Stall watchdog: pending inbound + stale agent activity → warn user
         # to /new (does not kill the turn; see agent.session_stall_timeout).
@@ -15527,6 +15720,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         explicit_id = bool(route.question_id) and text.startswith(route.question_id)
         if not explicit_id and (route.session_key or "") != session_key:
             return None
+        # A Woodhouse broker decision is not a clarify question: nobody in
+        # this process is waiting on it, and its answer is typed into
+        # another machine's terminal pane. Short-circuit before clarify.
+        try:
+            if await _forward_broker_reply(registry, self._send_question_text,
+                                           route):
+                return ""
+        except Exception:
+            logger.error("Broker reply forwarding failed for question %s",
+                         route.question_id, exc_info=True)
+            return None
         try:
             from tools import clarify_gateway as _clarify_mod
         except Exception:
@@ -15582,6 +15786,78 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
             except Exception:
                 logger.error("Question registry sweep failed", exc_info=True)
+            await asyncio.sleep(interval)
+
+    def _woodhouse_owner_session_key(self, cfg: dict | None = None) -> str:
+        """Which chat a broker decision is asked in.
+
+        A broker decision belongs to no session — it comes from a daemon,
+        not a turn — so the owner's chat has to be named. Configured key
+        wins; otherwise the single registered question sender is
+        unambiguous enough to use. With several chats in play and no
+        config, stay silent rather than surface one owner's infrastructure
+        decisions in whichever chat happened to ask a question first.
+        """
+        cfg = cfg if cfg is not None else _load_gateway_runtime_config()
+        configured = cfg_get(cfg, "woodhouse", "owner_session_key", default="")
+        if isinstance(configured, str) and configured:
+            return configured
+        senders = getattr(self, "_question_senders", None) or {}
+        if len(senders) == 1:
+            return next(iter(senders))
+        return ""
+
+    async def _poll_broker_decisions(self, interval: float = 0.0) -> None:
+        """Relay newly blocked Woodhouse agents onto the question wire.
+
+        Disabled by default: the relay ships dark and is switched on with
+        `woodhouse.decision_poll_seconds` (Task 10). Returning early on a
+        clean gate is deliberate — ``_spawn_supervised`` never respawns a
+        watcher that exits cleanly.
+        """
+        cfg = _load_gateway_runtime_config()
+        if interval <= 0:
+            interval = _woodhouse_decision_poll_seconds(cfg)
+        if interval <= 0:
+            logger.debug("Woodhouse decision relay disabled (poll seconds 0)")
+            return
+        enabled_plugins = cfg_get(cfg, "plugins", "enabled", default=[]) or []
+        if _WOODHOUSE_PLUGIN_SLUG not in enabled_plugins:
+            logger.info(
+                "Woodhouse decision relay idle: plugin %s is not enabled",
+                _WOODHOUSE_PLUGIN_SLUG,
+            )
+            return
+        await asyncio.sleep(30)  # initial delay — let the gateway settle
+        while self._running:
+            try:
+                registry = getattr(self, "_question_registry", None)
+                if registry is not None and _woodhouse_broker_socket_ready():
+                    session_key = self._woodhouse_owner_session_key(cfg)
+                    if not session_key:
+                        logger.warning(
+                            "Woodhouse decision relay has no owner session "
+                            "key; set woodhouse.owner_session_key",
+                        )
+                    else:
+                        # Blocking socket call — off the loop, like every
+                        # other broker call in this file.
+                        reply = await asyncio.to_thread(
+                            _woodhouse_broker_call, {"method": "decision.list"},
+                        )
+                        if isinstance(reply, dict) and reply.get("ok"):
+                            await _submit_broker_decisions(
+                                registry, self._send_question_text,
+                                session_key, reply.get("decisions") or [],
+                            )
+                        else:
+                            logger.warning(
+                                "Broker decision.list failed: %s",
+                                (reply or {}).get("error")
+                                if isinstance(reply, dict) else reply,
+                            )
+            except Exception:
+                logger.error("Woodhouse decision poll failed", exc_info=True)
             await asyncio.sleep(interval)
 
     async def _handle_gateway_platform_event(self, event: dict, source) -> None:
