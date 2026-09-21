@@ -29,6 +29,8 @@ def test_allowlisted_features_pass():
     {"task_priority": "call me on +27821234567"},        # identifier-like
     {"agent_health": "x" * 64},                          # free text too long
     {"task_priority": "0821234567"},                     # identifier-like, no separators (hardening)
+    {"task_priority": "082-123-4567"},                   # identifier-like, hyphen-separated (fix round 1)
+    {"task_priority": "082.123.4567"},                   # identifier-like, dot-separated (fix round 1)
 ])
 def test_violations_rejected(bad):
     with pytest.raises(FeatureViolation):
@@ -55,6 +57,18 @@ def test_malformed_response_is_fallback_not_crash():
     c = JevClient(api_key="k", transport=lambda body: {"unexpected": []})
     r = c.evaluate({"queue_depth": 1}, {"q": {"type": "noul", "instructions": "x"}})
     assert r == JevResult(ok=False, answers={}, error=r.error)
+
+
+def test_unserializable_questions_is_fallback_not_crash():
+    # Fix round 1, Important 4: cache-key json.dumps() ran outside any
+    # try/except, so a non-serializable questions payload raised straight
+    # out of evaluate() instead of degrading to a fallback.
+    class NotSerializable:
+        pass
+
+    c = JevClient(api_key="k", transport=lambda body: {"answers": {}})
+    r = c.evaluate({"queue_depth": 1}, {"q": NotSerializable()})
+    assert not r.ok
 
 
 def test_transport_exception_retries_once_then_fallback():
@@ -122,6 +136,42 @@ def test_score_held_questions_none_on_failure():
     # answer is missing the "score" field a real score-type answer carries.
     c = JevClient(api_key="k", transport=lambda b: {"answers": {"q_D-AAA": {"type": "score"}}})
     assert c.score_held_questions([{"question_id": "D-AAA", "age_seconds": 1}]) is None
+
+
+def test_score_held_questions_non_numeric_score_is_none():
+    # Fix round 1, Critical 3: a non-numeric "score" used to blow up
+    # sorted(scores, key=scores.get) with a TypeError instead of falling
+    # back, violating the "evaluate()/score_held_questions never raises"
+    # contract.
+    c = JevClient(api_key="k",
+                  transport=lambda b: {"answers": {"q_D-AAA": {"type": "score", "score": "high"},
+                                                    "q_D-BBB": {"type": "score", "score": 3}}})
+    assert c.score_held_questions([
+        {"question_id": "D-AAA", "age_seconds": 10},
+        {"question_id": "D-BBB", "age_seconds": 5},
+    ]) is None
+
+
+def test_score_held_questions_rejects_unsafe_question_id():
+    # Fix round 1, Critical 1: score_held_questions embedded
+    # feats[i]["question_id"] straight into a request dict key without
+    # ever validating it — a free-text/identifier-shaped question_id
+    # reached the transport unmodified. It must now be rejected before
+    # transport is ever called, and the whole call falls back to None.
+    calls = []
+
+    def t(body):
+        calls.append(1)
+        return {"answers": {}}
+
+    c = JevClient(api_key="k", transport=t)
+    bad_question_id = "please call me back about this at +27821234567 " * 3
+    assert len(bad_question_id) > 100
+    result = c.score_held_questions([
+        {"question_id": bad_question_id, "age_seconds": 1},
+    ])
+    assert result is None
+    assert calls == []  # never reached the transport
 
 
 def test_advise_task_class_returns_choice():

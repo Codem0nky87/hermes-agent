@@ -1,9 +1,18 @@
 """Jev advisory classifier client (amendment spec 2026-09-21 §4).
 
-THE ONLY permitted code path to jev-ai.pro. Feature allowlist is the
-privacy boundary: only enumerable structural values ever reach the
-request builder. Every failure degrades to a deterministic fallback
-(ok=False / None) — callers must always have a non-Jev default.
+THE ONLY permitted code path to jev-ai.pro. Feature values (the request
+"state") and any caller-supplied identifiers that get embedded into the
+request on this module's own initiative (e.g. score_held_questions'
+question_id) must pass the safe-token allowlist rule — bounded length,
+plain [A-Za-z0-9_.-] charset, no bare long digit run even once
+separators are stripped — before they reach the request builder; any
+failure there aborts the call (JevResult(ok=False) / None) rather than
+letting the value through. Question/answer *schema* (types,
+instructions, criteria — authored by this module's code, not raw user
+data) is passed through as-is; see evaluate()'s docstring. Every
+failure degrades to a deterministic fallback (ok=False / None) —
+callers must always have a non-Jev default, and evaluate() must never
+raise.
 
 Question/answer shapes below (score/choice/noul, "instructions",
 "criteria") reflect the live jev-ai.pro contract, verified against the
@@ -33,10 +42,14 @@ _MAX_STR = 32
 _SAFE_STR_RE = re.compile(r"^[A-Za-z0-9_\-\.]{1,32}$")
 # Privacy hardening: a value can pass the character-class check above yet
 # still be an identifier (phone number, account number, ...) if it has no
-# separators — e.g. "0821234567". Reject long bare digit runs; 7 digits is
+# separators — e.g. "0821234567" — or if its digits are merely broken up
+# by the very separators the charset allows — e.g. "082-123-4567" or
+# "082.123.4567". Strip [-._] before running the digit-run check so a
+# formatted identifier can't hide between allowed punctuation. 7 digits is
 # the conventional floor for "looks like a phone/account number" and no
 # legitimate structural value in ALLOWED_FEATURE_KEYS needs one.
 _IDENTIFIER_DIGIT_RUN_RE = re.compile(r"\d{7,}")
+_SEPARATOR_RE = re.compile(r"[-._]")
 _TASK_CLASSES = ("quick-fix", "feature", "review", "investigation")
 
 _SCORE_CRITERIA = ("low", "medium", "high", "critical")
@@ -57,6 +70,31 @@ class FeatureViolation(ValueError):
     pass
 
 
+def _is_safe_token(value: object) -> bool:
+    """The allowlist's safe-token rule, as its own function so every call
+    site that embeds a caller-supplied string into a request — not just
+    validate_features' own dict values — is forced through the same gate.
+
+    (A prior bypass let score_held_questions build request dict keys
+    from feats[i]["question_id"] directly, without ever calling this —
+    fixed by routing that value through here too.)
+    """
+    if not isinstance(value, str):
+        return False
+    # fullmatch (not match) — match()+"$" would let a value with a
+    # trailing "\n" slip through, since "$" may match just before a
+    # trailing newline instead of requiring true end-of-string.
+    if len(value) > _MAX_STR or not _SAFE_STR_RE.fullmatch(value):
+        return False
+    # Strip allowed separators before the digit-run check so a phone
+    # number formatted as "082-123-4567" / "082.123.4567" can't hide its
+    # digits from a check that only looked for one contiguous run.
+    stripped = _SEPARATOR_RE.sub("", value)
+    if _IDENTIFIER_DIGIT_RUN_RE.search(stripped):
+        return False
+    return True
+
+
 def validate_features(features: dict) -> dict:
     out: Dict[str, object] = {}
     for key, value in features.items():
@@ -66,16 +104,11 @@ def validate_features(features: dict) -> dict:
             out[key] = value
             continue
         if isinstance(value, str):
-            # fullmatch (not match) — match()+"$" would let a value with a
-            # trailing "\n" slip through, since "$" may match just before a
-            # trailing newline instead of requiring true end-of-string.
-            if len(value) > _MAX_STR or not _SAFE_STR_RE.fullmatch(value):
+            if not _is_safe_token(value):
                 raise FeatureViolation(
-                    f"feature {key!r} value is not a short safe token")
-            if _IDENTIFIER_DIGIT_RUN_RE.search(value):
-                raise FeatureViolation(
-                    f"feature {key!r} value looks like a phone/account "
-                    "identifier (long digit run)")
+                    f"feature {key!r} value is not an allowlisted safe "
+                    "token (unsafe charset/length, or looks like an "
+                    "identifier)")
             out[key] = value
             continue
         raise FeatureViolation(f"feature {key!r} has unsupported type")
@@ -139,12 +172,19 @@ class JevClient:
             safe = validate_features(features)
         except FeatureViolation as exc:
             return JevResult(ok=False, error=f"feature violation: {exc}")
-        body = {
-            "model": self._model,
-            "state": json.dumps(safe, sort_keys=True),
-            "questions": questions,
-        }
-        cache_key = json.dumps(body, sort_keys=True)
+        try:
+            body = {
+                "model": self._model,
+                "state": json.dumps(safe, sort_keys=True),
+                "questions": questions,
+            }
+            cache_key = json.dumps(body, sort_keys=True)
+        except Exception as exc:
+            # questions is caller-supplied and may contain values json
+            # can't serialize (a set, a custom object, ...) — that must
+            # degrade to a fallback like every other failure mode here,
+            # not raise out of evaluate().
+            return JevResult(ok=False, error=f"unserializable request: {exc}")
         now = time.monotonic()
         cached = self._cache.get(cache_key)
         if cached is not None and now - cached[0] < self._cache_ttl:
@@ -165,6 +205,13 @@ class JevClient:
 
     # -- decision-point helpers -------------------------------------------
     def score_held_questions(self, feats: List[dict]) -> Optional[List[str]]:
+        # Every question_id becomes a request dict key below — route each
+        # one through the same safe-token gate as any other value reaching
+        # the request builder before it's embedded anywhere, or fall back
+        # without ever calling evaluate()/transport.
+        for f in feats:
+            if not _is_safe_token(f.get("question_id")):
+                return None
         questions = {
             f"q_{f['question_id']}": {
                 "type": "score",
@@ -182,7 +229,14 @@ class JevClient:
             ans = result.answers.get(f"q_{f['question_id']}")
             if not isinstance(ans, dict) or "score" not in ans:
                 return None
-            scores[f["question_id"]] = ans["score"]
+            score = ans["score"]
+            # bool is an int subclass in Python — exclude it explicitly so
+            # a stray True/False can't silently sort as 0/1, and reject any
+            # other non-numeric score (e.g. a str) instead of letting
+            # sorted()'s key comparison raise TypeError out of this method.
+            if isinstance(score, bool) or not isinstance(score, (int, float)):
+                return None
+            scores[f["question_id"]] = score
         return sorted(scores, key=scores.get, reverse=True)
 
     def advise_task_class(self, features: dict) -> Optional[str]:
