@@ -5,6 +5,7 @@ coalescer holds dispatch briefly and merges same-chat fragments into one
 combined turn. Safety commands bypass and stop-class commands drop held work.
 """
 import asyncio
+import logging
 
 import pytest
 
@@ -114,3 +115,38 @@ async def test_zero_window_disables_coalescing():
     await c.submit("chat1", _ev(text="hi"))
     await asyncio.sleep(0)
     assert len(out) == 1
+
+
+@pytest.mark.asyncio
+async def test_timer_flush_dispatch_failure_is_logged_and_state_recovers(caplog):
+    # Fix round 1: dispatch() raising on the timer-driven (window-expiry)
+    # flush path must not be silently swallowed by the detached flush task,
+    # and the held state for that chat must still be cleared so later
+    # messages keep flowing.
+    calls = []
+
+    async def flaky_dispatch(event):
+        calls.append(event)
+        if len(calls) == 1:
+            raise RuntimeError("boom")
+
+    c = InboundCoalescer(
+        flaky_dispatch, text_window=0.05, media_window=0.1, max_window=0.2
+    )
+
+    with caplog.at_level(logging.ERROR, logger="gateway.inbound_coalesce"):
+        await c.submit("chat1", _ev(text="first"))
+        await asyncio.sleep(0.15)  # let the timer-driven flush fire and fail
+
+    assert len(calls) == 1  # dispatch was attempted despite the failure
+    assert any(
+        "dispatch failed" in record.message and record.levelno == logging.ERROR
+        for record in caplog.records
+    )
+
+    # Held state for "chat1" must have been cleaned up despite the failure,
+    # so a later message opens a fresh hold and still gets dispatched.
+    await c.submit("chat1", _ev(text="second"))
+    await asyncio.sleep(0.15)
+    assert len(calls) == 2
+    assert calls[1].text == "second"

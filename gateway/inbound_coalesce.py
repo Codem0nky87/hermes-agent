@@ -9,8 +9,11 @@ stop-class commands also drop held work for that chat.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from typing import Any, Awaitable, Callable, Dict, List
+
+logger = logging.getLogger(__name__)
 
 MEDIA_ONLY_NOTE = (
     "[attachment arrived with no instruction — ask the user what to do "
@@ -94,7 +97,24 @@ class InboundCoalescer:
             held.timer.cancel()
 
     def _flush_soon(self, key: str) -> None:
-        asyncio.ensure_future(self._flush(key))
+        task = asyncio.ensure_future(self._flush(key))
+        task.add_done_callback(self._log_flush_failure)
+
+    @staticmethod
+    def _log_flush_failure(task: "asyncio.Future[None]") -> None:
+        # Timer-driven flushes run detached from any caller (unlike the
+        # immediate-dispatch paths in submit(), where a raised exception
+        # propagates straight back to whoever called submit()). Without this,
+        # a dispatch() failure on the window-expiry path — the common path
+        # for coalesced turns — would be silently swallowed by asyncio.
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(
+                "inbound coalescer: dispatch failed during window-expiry flush",
+                exc_info=exc,
+            )
 
     async def _flush(self, key: str) -> None:
         held = self._held.pop(key, None)
