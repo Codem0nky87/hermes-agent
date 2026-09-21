@@ -22,7 +22,7 @@
 import { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, downloadMediaMessage, getAggregateVotesInPollMessage, decryptPollVote, getKeyAuthor, jidNormalizedUser } from '@whiskeysockets/baileys';
 import express from 'express';
 import path from 'path';
-import { mkdirSync, readFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
+import { mkdirSync, readFileSync, existsSync, readdirSync, statSync, unlinkSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { randomBytes } from 'crypto';
 import { execFileSync } from 'child_process';
@@ -33,6 +33,17 @@ import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import { createBaileysLogger, boundedLogText } from './baileys_logger.js';
 import { createConnectionCloseHandler, describeDisconnect } from './connection_close.js';
+import {
+  ATTACH_NOT_COLLECTING,
+  ATTACH_START_ACK,
+  ATTACH_USAGE,
+  attachManifestPath,
+  buildAttachSummary,
+  displayNameForEvent,
+  humanSize,
+  parseAttachCommand,
+  persistAttachManifest,
+} from './attach.js';
 import {
   BRIDGE_EXIT_LOGGED_OUT,
   BRIDGE_EXIT_REPAIR_REQUIRED,
@@ -231,6 +242,8 @@ const MAX_DIAGNOSTIC_COUNT = 1000;
 const DEBUG_STAGES = new Set(['upsert', 'ignored', 'self_chat_check', 'queued']);
 const DEBUG_REASONS = new Set([
   'agent_echo',
+  'attach_protocol',
+  'attach_receipt',
   'empty',
   'foreign_poll_update',
   'from_me_group',
@@ -348,6 +361,106 @@ const MAX_QUEUE_SIZE = 100;
 const recentlySentIds = createOutboundIdTracker(512);
 const recentlyProcessedPollUpdates = createOutboundIdTracker(512);
 const messageStore = createBoundedMessageStore(512);
+
+// --- Batch-attach protocol (see attach.js) --------------------------------
+// One active batch per chat. While a batch is open the bridge answers
+// directly: an ack on /attach start, a one-line receipt per downloaded
+// attachment, and a manifest summary + question on /attach stop. None of
+// those messages reach the agent queue, so the agent is not pulled onto the
+// first file of a burst — it wakes once for the summary and asks first.
+const attachBatches = new Map();
+
+function attachChatKey(chatId) {
+  return String(chatId || '').replace(/@.*/, '');
+}
+
+function attachPaths(chatId) {
+  return attachManifestPath(SESSION_DIR, attachChatKey(chatId));
+}
+
+/**
+ * Send a bridge-side attach reply: echo-suppressed (remembered as a sent id)
+ * and never enqueued for the agent. Fire-and-forget on purpose — the caller
+ * must not fail the whole upsert batch because one ack send hiccuped.
+ */
+async function sendAttachMessage(chatId, text) {
+  try {
+    const chunks = splitLongMessage(formatOutgoingMessage(text));
+    for (let i = 0; i < chunks.length; i += 1) {
+      const { content: payload, options } = buildTextSendPayload(chunks[i], {
+        chatId,
+        messageStore,
+      });
+      const sent = await sendWithTimeout(chatId, payload, options);
+      trackSentMessageId(sent);
+      messageStore.remember(sent);
+      if (chunks.length > 1 && i < chunks.length - 1) {
+        await sleep(CHUNK_DELAY_MS);
+      }
+    }
+  } catch {
+    try {
+      console.warn('[bridge] attach reply failed.');
+    } catch {
+      // diagnostics must never break the loop
+    }
+  }
+}
+
+function closeAttachBatch(chatId) {
+  const batch = attachBatches.get(attachChatKey(chatId));
+  attachBatches.delete(attachChatKey(chatId));
+  return batch || null;
+}
+
+function handleAttachCommand({ chatId, command }) {
+  const key = attachChatKey(chatId);
+  const { dir, file } = attachPaths(chatId);
+
+  if (command === 'start') {
+    closeAttachBatch(chatId);
+    const batch = {
+      id: `b${Date.now()}`,
+      startedAt: new Date().toISOString(),
+      chatId: chatId || '',
+      seq: 0,
+      files: [],
+    };
+    attachBatches.set(key, batch);
+    persistAttachManifest({ dir, file, chatId, batch });
+    void sendAttachMessage(chatId, ATTACH_START_ACK);
+    return true;
+  }
+
+  const batch = attachBatches.get(key);
+  if (!batch) {
+    // /attach stop (or usage) with no open batch: one short note, still no
+    // agent traffic.
+    void sendAttachMessage(chatId, command === 'stop' ? ATTACH_NOT_COLLECTING : ATTACH_USAGE);
+    return true;
+  }
+
+  if (command === 'usage') {
+    void sendAttachMessage(chatId, ATTACH_USAGE);
+    return true;
+  }
+
+  // 'stop'
+  const entries = (batch.files || []).map((f) => ({
+    seq: f.seq,
+    name: f.name,
+    sizeBytes: f.sizeBytes,
+    path: f.path,
+    failed: !!f.failed,
+  }));
+  const stoppedAt = new Date().toISOString();
+  const summary = buildAttachSummary(entries);
+  closeAttachBatch(chatId);
+  const closed = { ...batch, stoppedAt };
+  persistAttachManifest({ dir, file, chatId, batch: closed });
+  void sendAttachMessage(chatId, summary);
+  return true;
+}
 
 function normalizePollUpdateOptions(aggregation, pollUpdateMessage, meId) {
   const selected = [];
@@ -738,6 +851,19 @@ async function startSocket() {
       }
 
       const messageContent = getMessageContent(msg);
+
+      // Batch-attach protocol: /attach start | stop | usage are answered
+      // entirely by the bridge (ack, receipts, summary + question) and never
+      // reach the agent queue. See attach.js.
+      const attachCommand = parseAttachCommand(
+        messageContent.conversation ?? messageContent.extendedTextMessage?.text ?? ''
+      );
+      if (attachCommand) {
+        handleAttachCommand({ chatId, command: attachCommand });
+        emitDebugEvent({ stage: 'ignored', reason: 'attach_protocol' });
+        continue;
+      }
+
       if (messageContent.pollUpdateMessage) {
         const pollUpdateMessage = messageContent.pollUpdateMessage;
         const pollKey = pollUpdateMessage.pollCreationMessageKey || {
@@ -825,6 +951,44 @@ async function startSocket() {
           reason: 'empty',
         });
         continue;
+      }
+
+      // Batch-attach protocol: while a batch is open for this chat, each
+      // downloaded attachment earns one short receipt (name + size) from the
+      // bridge and is withheld from the agent. The agent wakes once, for the
+      // /attach stop summary, and must ask before touching anything.
+      if (event.hasMedia) {
+        const attachKey = attachChatKey(chatId);
+        const batch = attachBatches.get(attachKey);
+        if (batch) {
+          const url = Array.isArray(event.mediaUrls) ? (event.mediaUrls[0] || '') : '';
+          let sizeBytes = -1;
+          try {
+            sizeBytes = url ? statSync(url).size : -1;
+          } catch {
+            sizeBytes = -1;
+          }
+          const failed = !url; // CDN fetch failed; nothing on disk to point at
+          const name = displayNameForEvent({
+            fileName: event.fileName,
+            mediaType: event.mediaType,
+            mediaUrls: event.mediaUrls,
+            messageId: event.messageId,
+          });
+          batch.seq += 1;
+          batch.files.push({ seq: batch.seq, name, sizeBytes, path: url, failed });
+          const { dir, file } = attachPaths(chatId);
+          persistAttachManifest({ dir, file, chatId, batch });
+          const sizeText = humanSize(sizeBytes);
+          const mark = failed ? '⚠' : '✓';
+          const note = failed ? ' — download failed' : '';
+          void sendAttachMessage(
+            chatId,
+            `${mark} ${batch.seq}. ${name}${sizeText ? ` (${sizeText})` : ''}${note}`
+          );
+          emitDebugEvent({ stage: 'ignored', reason: 'attach_receipt' });
+          continue;
+        }
       }
 
       messageStore.remember(msg);
