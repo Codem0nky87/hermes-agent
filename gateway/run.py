@@ -3573,8 +3573,20 @@ async def _deliver_promoted_question(send, reask) -> None:
 
 
 async def _resolve_question_gated(registry, send, question_id):
-    """Mark a question answered and deliver whatever the wire frees up."""
-    reask = registry.resolve(question_id)
+    """Mark a question answered and deliver whatever the wire frees up.
+
+    ``resolve`` runs on a worker thread because it is a *blocking* call from
+    this loop's point of view: it takes the registry's process-wide lock, opens
+    a ``BEGIN IMMEDIATE`` sqlite transaction, and — when a held queue exists —
+    calls the Jev scorer, which does synchronous urllib I/O (3 s timeout, one
+    retry ⇒ up to ~6 s against a slow or unreachable Jev). Left inline, that
+    stalls the whole gateway event loop: typing indicators, heartbeats and
+    every platform adapter for every chat. The registry is thread-safe by
+    design (``check_same_thread=False`` plus its own ``_LOCK``), so handing the
+    call to a thread is the correct and least invasive place to break the
+    stall — the registry itself stays synchronous.
+    """
+    reask = await asyncio.to_thread(registry.resolve, question_id)
     if reask is not None:
         await _deliver_promoted_question(send, reask)
     return reask
@@ -3583,10 +3595,15 @@ async def _resolve_question_gated(registry, send, question_id):
 async def _cancel_question_gated(registry, send, question_id):
     """Retire a question nobody is waiting on any more.
 
-    Unlike ``_resolve_question_gated`` this promotes a successor ONLY when the
-    cancelled question was the one on the wire — see ``QuestionRegistry.cancel``.
+    Like ``_resolve_question_gated`` this promotes a successor ONLY when the
+    cancelled question was the one on the wire and the wire is free afterwards
+    — see ``QuestionRegistry.cancel``.
+
+    Runs on a worker thread for the same reason ``_resolve_question_gated``
+    does: cancelling the question on the wire promotes the next one, and that
+    promotion path can call the blocking Jev scorer.
     """
-    reask = registry.cancel(question_id)
+    reask = await asyncio.to_thread(registry.cancel, question_id)
     if reask is not None:
         await _deliver_promoted_question(send, reask)
     return reask

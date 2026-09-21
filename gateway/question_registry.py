@@ -4,6 +4,11 @@ One non-critical question on the wire at a time; fixed critical classes
 preempt; resolving frees the wire and promotes the preempted question
 first, then the held queue (scorer order if set, else FIFO). SQLite in
 WAL mode; BEGIN IMMEDIATE serializes the send/hold race.
+
+Retiring a question (``resolve``/``cancel``) promotes a successor only when
+that question was the one on the wire AND the wire is empty afterwards — see
+``_promote_if_wire_free``. Answering a preempted question, or one of two
+back-to-back criticals, frees nothing.
 """
 from __future__ import annotations
 
@@ -161,18 +166,36 @@ class QuestionRegistry:
         return SubmitResult(qid, action, preempted_id)
 
     def resolve(self, question_id: str) -> Optional[ReaskInfo]:
+        """Mark a question answered and promote a successor onto the wire.
+
+        Promotion is guarded exactly like ``cancel``'s, and for the same
+        reason: only a ``pending`` question occupies the wire. A ``preempted``
+        question can still be answered by id (the user can see it in their
+        history and reply to it), but answering it frees nothing — promoting
+        then would put a second question on the wire underneath the critical
+        one that is still pending, breaking the one-question-at-a-time
+        invariant (spec §3.2.1/§3.2.3) and making bare replies ambiguous.
+
+        The "no other pending row remains" clause covers the same hazard from
+        the other direction: back-to-back criticals. Resolving the first while
+        the second is still pending must not promote a normal question
+        alongside it. Only when the wire is genuinely empty does the next
+        question go out.
+        """
         with _LOCK:
             cur = self._db.cursor()
             cur.execute("BEGIN IMMEDIATE")
+            nxt = None
             try:
+                row = cur.execute(
+                    "SELECT status FROM questions WHERE question_id=?",
+                    (question_id,)).fetchone()
+                was_on_the_wire = row is not None and row[0] == "pending"
                 cur.execute(
                     "UPDATE questions SET status='answered' WHERE question_id=?",
                     (question_id,))
-                nxt = self._pick_next(cur)
-                if nxt is not None:
-                    cur.execute(
-                        "UPDATE questions SET status='pending' WHERE question_id=?",
-                        (nxt.question_id,))
+                if was_on_the_wire:
+                    nxt = self._promote_if_wire_free(cur)
                 self._db.commit()
             except BaseException:
                 self._db.rollback()
@@ -189,6 +212,9 @@ class QuestionRegistry:
         question the user is actually looking at. Any other status (already
         answered or expired) is a no-op, which makes this safe to call from a
         release path racing an inbound answer.
+
+        Promotion additionally requires the wire to be empty afterwards — see
+        ``_promote_if_wire_free`` for the back-to-back-critical case.
         """
         with _LOCK:
             cur = self._db.cursor()
@@ -206,11 +232,7 @@ class QuestionRegistry:
                     "UPDATE questions SET status='expired' WHERE question_id=?",
                     (question_id,))
                 if was_on_the_wire:
-                    nxt = self._pick_next(cur)
-                    if nxt is not None:
-                        cur.execute(
-                            "UPDATE questions SET status='pending' "
-                            "WHERE question_id=?", (nxt.question_id,))
+                    nxt = self._promote_if_wire_free(cur)
                 self._db.commit()
             except BaseException:
                 self._db.rollback()
@@ -329,6 +351,28 @@ class QuestionRegistry:
             "ORDER BY created_at").fetchall()]
 
     # -- internals --------------------------------------------------------
+    def _promote_if_wire_free(self, cur) -> Optional[ReaskInfo]:
+        """Put the next question on the wire — but only if the wire is empty.
+
+        Called by ``resolve``/``cancel`` *after* the retiring question's row
+        has been updated, and only when that question was the one on the wire.
+        A ``pending`` row still remaining at that point means a critical
+        question holds the wire (two criticals can be pending back to back),
+        and promoting underneath it would deliver a second question the user
+        was never meant to see yet — the same one-question-at-a-time invariant
+        the ``was_on_the_wire`` guard protects from the other direction.
+        """
+        if cur.execute(
+            "SELECT 1 FROM questions WHERE status='pending' LIMIT 1"
+        ).fetchone() is not None:
+            return None
+        nxt = self._pick_next(cur)
+        if nxt is not None:
+            cur.execute(
+                "UPDATE questions SET status='pending' WHERE question_id=?",
+                (nxt.question_id,))
+        return nxt
+
     def _pick_next(self, cur) -> Optional[ReaskInfo]:
         row = cur.execute(
             "SELECT question_id, task_ref, session_key, body FROM questions "

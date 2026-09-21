@@ -227,6 +227,66 @@ def test_promotion_marks_only_preempted_questions_as_reasks(reg):
     assert reasked.was_preempted is True
 
 
+def test_answering_a_preempted_question_promotes_nothing(reg):
+    """Final review, Important 1: a preempted question is still answerable by
+    id (the user can see it in their history), but it is NOT on the wire.
+    Promoting on its resolution would put a second question in front of the
+    user while the critical one is still pending."""
+    normal = reg.submit(task_ref="t1", session_key="s1", body="deploy now?")
+    held = reg.submit(task_ref="t2", session_key="s2", body="rename module?")
+    crit = reg.submit(task_ref="t9", session_key="s9", body="auth expired",
+                      critical_class="auth_expiry")
+    assert crit.preempted_id == normal.question_id
+
+    # The reply still routes — answering a preempted question is by design.
+    route = reg.route_reply(f"{normal.question_id} yes")
+    assert route.status == "routed" and route.task_ref == "t1"
+
+    assert reg.resolve(normal.question_id) is None  # nothing promoted
+    assert reg.pending() == crit.question_id  # critical is still alone
+    assert reg.held_ids() == [held.question_id]  # sibling stayed held
+    assert reg.route_reply(f"{normal.question_id} again").status == "expired"
+
+    # Resolving the critical — the question that IS on the wire — promotes.
+    nxt = reg.resolve(crit.question_id)
+    assert nxt is not None and nxt.question_id == held.question_id
+    assert reg.pending() == held.question_id
+
+
+def test_resolving_one_critical_while_another_is_pending_promotes_nothing(reg):
+    """Ledger T4, folded into the Important 1 patch: two criticals can be
+    pending at once (a critical never preempts another critical). Resolving
+    the first must not promote a normal question underneath the second."""
+    normal = reg.submit(task_ref="t1", session_key="s1", body="deploy?")
+    first_crit = reg.submit(task_ref="t8", session_key="s8", body="auth!",
+                            critical_class="auth_expiry")
+    second_crit = reg.submit(task_ref="t9", session_key="s9", body="disk full",
+                             critical_class="infra_failure")
+    assert second_crit.action == "send"
+    assert second_crit.preempted_id is None  # nothing non-critical to preempt
+
+    assert reg.resolve(first_crit.question_id) is None
+    assert reg.pending() == second_crit.question_id
+    # The preempted normal question is still waiting, not on the wire.
+    assert reg.route_reply(f"{normal.question_id} x").status == "routed"
+
+    nxt = reg.resolve(second_crit.question_id)
+    assert nxt is not None and nxt.question_id == normal.question_id
+    assert nxt.was_preempted is True
+    assert reg.pending() == normal.question_id
+
+
+def test_resolving_an_unknown_id_promotes_nothing(reg):
+    """The promotion guard also closes the ledger's 'resolve doesn't validate
+    id' gap: a bogus id updates no row, so it frees no wire."""
+    on_the_wire = reg.submit(task_ref="t1", session_key="s1", body="q1")
+    held = reg.submit(task_ref="t2", session_key="s2", body="q2")
+
+    assert reg.resolve("D-ZZZ") is None
+    assert reg.pending() == on_the_wire.question_id
+    assert reg.held_ids() == [held.question_id]
+
+
 def test_gentle_reask_once_at_half_ttl(tmp_path):
     clock = [0.0]
     reg = QuestionRegistry(str(tmp_path / "q4.db"), now=lambda: clock[0], default_ttl=100)

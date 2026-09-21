@@ -184,6 +184,65 @@ async def test_zero_text_window_still_merges_into_an_open_media_window():
 
 
 @pytest.mark.asyncio
+async def test_album_holds_the_media_window_open_until_its_caption():
+    """Final review, Important 3: the continuation window used to be
+    ``_text_window`` for every merge. With the live ``text_window: 0`` the
+    second photo of an album flushed the turn on the spot — text-less, so it
+    got MEDIA_ONLY_NOTE appended — and the caption then arrived orphaned in a
+    turn of its own. The window must come from the held turn's own shape:
+    still media-only ⇒ keep the media window open."""
+    out = []
+    c = _coalescer(out, text_window=0, media_window=0.1)
+
+    await c.submit("chat1", _ev(media=["/tmp/a.jpg"]))
+    await asyncio.sleep(0.02)
+    await c.submit("chat1", _ev(media=["/tmp/b.jpg"]))
+    await asyncio.sleep(0.02)
+    assert out == []  # the second photo must NOT have flushed the album
+
+    await c.submit("chat1", _ev(text="crop both to square"))
+    await asyncio.sleep(0.15)
+
+    assert len(out) == 1  # one turn, not two
+    assert out[0].media_urls == ["/tmp/a.jpg", "/tmp/b.jpg"]
+    assert out[0].text == "crop both to square"
+    assert MEDIA_ONLY_NOTE not in out[0].text
+
+
+@pytest.mark.asyncio
+async def test_caption_still_closes_the_window_immediately_at_zero_text_window():
+    """The other half of the same rule: once instruction text has joined the
+    turn it is complete, so ``text_window=0`` still means zero added latency —
+    the merged turn goes out at once rather than waiting out the media window."""
+    out = []
+    c = _coalescer(out, text_window=0, media_window=5.0, max_window=10.0)
+    await c.submit("chat1", _ev(media=["/tmp/a.jpg"]))
+    await c.submit("chat1", _ev(text="resize to 512px"))
+    await asyncio.sleep(0)  # no window wait, despite the 5s media window
+
+    assert len(out) == 1
+    assert out[0].media_urls == ["/tmp/a.jpg"]
+    assert out[0].text == "resize to 512px"
+    assert c._held == {}
+
+
+@pytest.mark.asyncio
+async def test_media_only_album_still_gets_the_note_when_no_caption_arrives():
+    """An album nobody captions is still a media-only turn: the note must
+    survive the class-aware window change."""
+    out = []
+    c = _coalescer(out, text_window=0, media_window=0.08)
+    await c.submit("chat1", _ev(media=["/tmp/a.jpg"]))
+    await asyncio.sleep(0.02)
+    await c.submit("chat1", _ev(media=["/tmp/b.jpg"]))
+    await asyncio.sleep(0.25)
+
+    assert len(out) == 1
+    assert out[0].media_urls == ["/tmp/a.jpg", "/tmp/b.jpg"]
+    assert MEDIA_ONLY_NOTE in out[0].text
+
+
+@pytest.mark.asyncio
 async def test_media_window_still_holds_when_text_window_is_zero():
     out = []
     c = _coalescer(out, text_window=0, media_window=0.15)

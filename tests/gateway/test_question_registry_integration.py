@@ -1,5 +1,9 @@
 """Outbound questions pass through the registry gate; replies route before
 LLM dispatch; critical resolution re-sends the preempted question."""
+import asyncio
+import contextlib
+import threading
+import time
 import uuid
 from types import SimpleNamespace
 
@@ -119,6 +123,87 @@ async def test_dispatch_sends_the_wire_text_and_holds_the_second(tmp_path):
     # Held: nothing sent, but the caller still holds an id it can cancel.
     assert ok2 is True and second is not None and len(seen) == 1
     assert reg.held_ids() == [second]
+
+
+async def _loop_responsiveness_during(coro, *, tick=0.01):
+    """Run *coro*, counting how many times a plain heartbeat task gets to run.
+
+    A blocking call left on the event loop freezes every other coroutine for
+    its whole duration, so the heartbeat count is a direct measurement of
+    whether the loop stayed alive.
+    """
+    ticks = 0
+
+    async def heartbeat():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(tick)
+            ticks += 1
+
+    beat = asyncio.ensure_future(heartbeat())
+    try:
+        result = await coro
+    finally:
+        beat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await beat
+    return result, ticks
+
+
+@pytest.mark.asyncio
+async def test_slow_scorer_does_not_block_the_gateway_loop(tmp_path):
+    """Final review, Important 2: the Jev scorer does synchronous urllib I/O
+    (3 s timeout plus one retry ⇒ up to ~6 s) from inside the registry lock
+    and an open sqlite transaction. Called inline from the gateway's async
+    paths it stalls typing indicators, heartbeats and every adapter, for every
+    chat. The async call sites must hand it to a thread."""
+    from gateway import run as run_mod
+
+    reg = QuestionRegistry(str(tmp_path / "q.db"))
+    out = _Sent()
+    on_the_wire = reg.submit(task_ref="t1", session_key="s1", body="deploy?")
+    held = reg.submit(task_ref="t2", session_key="s2", body="rename?")
+
+    scored = threading.Event()
+
+    def slow_scorer(feats):
+        scored.set()
+        time.sleep(0.5)  # a slow / unreachable Jev
+        return [f["question_id"] for f in feats]
+
+    reg.set_scorer(slow_scorer)
+
+    reask, ticks = await _loop_responsiveness_during(
+        run_mod._resolve_question_gated(reg, out.send, on_the_wire.question_id)
+    )
+
+    assert scored.is_set()  # the slow scorer really did run
+    # Inline on the loop this would be 0: nothing else gets to run for 0.5 s.
+    assert ticks >= 10, f"event loop stalled during resolve (ticks={ticks})"
+    assert reask is not None and reask.question_id == held.question_id
+    assert len(out.messages) == 1  # promotion still happened
+
+
+@pytest.mark.asyncio
+async def test_slow_scorer_does_not_block_the_loop_on_cancel(tmp_path):
+    """``cancel`` reaches the same scorer through the promotion path — the
+    release path (button answers, clarify timeouts, failed sends) must stay
+    off the loop too."""
+    from gateway import run as run_mod
+
+    reg = QuestionRegistry(str(tmp_path / "q.db"))
+    out = _Sent()
+    on_the_wire = reg.submit(task_ref="t1", session_key="s1", body="deploy?")
+    held = reg.submit(task_ref="t2", session_key="s2", body="rename?")
+    reg.set_scorer(lambda feats: time.sleep(0.5) or
+                   [f["question_id"] for f in feats])
+
+    reask, ticks = await _loop_responsiveness_during(
+        run_mod._cancel_question_gated(reg, out.send, on_the_wire.question_id)
+    )
+
+    assert ticks >= 10, f"event loop stalled during cancel (ticks={ticks})"
+    assert reask is not None and reask.question_id == held.question_id
 
 
 @pytest.mark.asyncio

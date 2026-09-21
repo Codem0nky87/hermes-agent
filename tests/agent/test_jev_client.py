@@ -193,3 +193,54 @@ def test_advise_task_class_unknown_value_is_none():
                   transport=lambda b: {"answers": {"task_class": {"type": "choice",
                                                                    "choice": "not-a-real-class"}}})
     assert c.advise_task_class({"queue_depth": 1}) is None
+
+
+# --- default transport ----------------------------------------------------
+
+
+def test_default_transport_carries_the_cloudflare_headers(monkeypatch):
+    """Final review, Minor 6 (ledger T8): jev-ai.pro sits behind Cloudflare,
+    which 403s urllib's default "Python-urllib/x.y" User-Agent as a bot
+    signature. If a refactor drops that header every live call fails,
+    score_held_questions returns None, and the registry's `except Exception:
+    pass` degrades question ordering to FIFO *silently and permanently*. Pin
+    the headers the live contract depends on."""
+    captured = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b'{"answers": {"q": {"type": "score", "score": 1}}}'
+
+    def fake_urlopen(request, timeout=None):
+        captured["request"] = request
+        captured["timeout"] = timeout
+        return _Response()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    # No transport= ⇒ the real _default_transport is built and exercised.
+    client = JevClient(api_key="secret-key", timeout=1.5)
+    result = client.evaluate(
+        {"queue_depth": 1}, {"q": {"type": "score", "instructions": "x"}})
+
+    assert result.ok
+    request = captured["request"]
+    # urllib capitalizes header keys ("User-Agent" -> "User-agent"), so
+    # compare case-insensitively rather than pinning urllib's spelling.
+    headers = {k.lower(): v for k, v in request.header_items()}
+
+    user_agent = headers.get("user-agent")
+    assert user_agent, "User-Agent missing — Cloudflare would 403 every call"
+    assert "Mozilla/5.0" in user_agent
+    assert "Python-urllib" not in user_agent
+    assert headers.get("accept") == "application/json"
+    assert headers.get("authorization") == "Bearer secret-key"
+    assert headers.get("content-type") == "application/json"
+    assert captured["timeout"] == 1.5
+    assert request.full_url == "https://jev-ai.pro/api/v1/systemone"

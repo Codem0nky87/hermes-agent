@@ -82,14 +82,17 @@ class InboundCoalescer:
             return
 
         # A window IS open for this chat: merge regardless of the arriving
-        # message's own window setting. This is what keeps the caption case
-        # working with text_window=0 — media opens the media window, and the
-        # caption that follows still joins that turn instead of racing it.
+        # message's own window setting, then re-arm from the merged turn's
+        # shape (_window_for_held). This is what keeps the caption case
+        # working with text_window=0 — media opens the media window, the next
+        # photo of an album keeps it open, and the caption that follows joins
+        # that turn (and, at text_window=0, closes it immediately) instead of
+        # racing it.
         held.events.append(event)
         held.timer.cancel()
         elapsed = time.monotonic() - held.first_at
         remaining_cap = self._max_window - elapsed
-        window = min(self._text_window, max(remaining_cap, 0.0))
+        window = min(self._window_for_held(held), max(remaining_cap, 0.0))
         if window <= 0.0:
             await self._flush(key)
         else:
@@ -98,8 +101,35 @@ class InboundCoalescer:
     # -- internals --------------------------------------------------------
     def _window_for(self, event: Any) -> float:
         """Opening window for *event*; ``<= 0`` disables holding for its class."""
-        has_media = bool(getattr(event, "media_urls", None))
-        has_text = bool((getattr(event, "text", "") or "").strip())
+        return self._window_class(
+            bool(getattr(event, "media_urls", None)),
+            bool((getattr(event, "text", "") or "").strip()),
+        )
+
+    def _window_for_held(self, held: "_Held") -> float:
+        """Reset window for a turn that is still collecting fragments.
+
+        Classified from the HELD TURN's aggregate content, not from the
+        fragment that just arrived: the merged turn is what gets dispatched,
+        so it is what decides how much longer to keep collecting. A turn that
+        is still media-only keeps the (longer) media window open, and closes
+        down to the text window the moment any instruction text joins it.
+
+        Reusing ``_text_window`` here unconditionally was the album bug: with
+        the live ``text_window: 0``, the second photo of an album computed a
+        zero window and flushed a text-less turn on the spot — which then got
+        MEDIA_ONLY_NOTE appended ("ask the user what to do with it") while the
+        caption arrived afterwards as a separate, orphaned turn. That is
+        exactly the split-caption failure the coalescer exists to prevent.
+        """
+        has_media = any(getattr(e, "media_urls", None) for e in held.events)
+        has_text = any(
+            (getattr(e, "text", "") or "").strip() for e in held.events
+        )
+        return self._window_class(has_media, has_text)
+
+    def _window_class(self, has_media: bool, has_text: bool) -> float:
+        """Window for content with the given shape — one rule, two callers."""
         if has_media and not has_text:
             return self._media_window
         return self._text_window
