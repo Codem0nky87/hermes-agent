@@ -85,6 +85,48 @@ def test_kanban_list_shapes_request(monkeypatch):
     assert captured == {"method": "kanban.list", "params": {"board": "orch-wave23"}}
 
 
+def test_fetch_codes_shapes_request(monkeypatch):
+    """Wave-4 Task 6: the 4th tool delegates to the bounded email-read tool
+    (agent.email_read.fetch_codes) — not the broker — with the provider and
+    since_minutes, and passes its dict through unchanged."""
+    captured = {}
+
+    def fake_fetch(provider, since_minutes=10):
+        captured["provider"] = provider
+        captured["since_minutes"] = since_minutes
+        return {"ok": True, "codes": [{"code_or_link": "482913",
+                                       "received_at": "2026-09-22T07:00:00Z",
+                                       "matched": "sign.?in"}], "error": None}
+
+    monkeypatch.setattr(mod.email_read, "fetch_codes", fake_fetch)
+    out = mod.woodhouse_fetch_codes("codex", since_minutes=5)
+    assert out["ok"] is True and out["codes"][0]["code_or_link"] == "482913"
+    assert captured == {"provider": "codex", "since_minutes": 5}
+
+
+def test_fetch_codes_errors_are_translated_not_raised(monkeypatch):
+    """Parity with the broker tools: an exception from the email tool becomes
+    an {"ok": False, ...} dict rather than reaching the model."""
+    def boom(provider, since_minutes=10):
+        raise RuntimeError("graph down")
+
+    monkeypatch.setattr(mod.email_read, "fetch_codes", boom)
+    out = mod.woodhouse_fetch_codes("codex")
+    assert out["ok"] is False and "email tool error" in out["error"]
+
+
+def test_fetch_codes_handler_returns_json_and_requires_provider(monkeypatch):
+    def fake_fetch(provider, since_minutes=10):
+        return {"ok": True, "codes": [], "error": None}
+
+    monkeypatch.setattr(mod.email_read, "fetch_codes", fake_fetch)
+    out = json.loads(mod._handle_woodhouse_fetch_codes(
+        {"provider": "claude", "since_minutes": 3}))
+    assert out["ok"] is True
+    missing = json.loads(mod._handle_woodhouse_fetch_codes({}))
+    assert "error" in missing
+
+
 def test_broker_call_errors_are_translated_not_raised(monkeypatch):
     """Every broker tool function must swallow OSError/ValueError from the
     socket layer into an {"ok": False, "error": ...} dict rather than
@@ -119,7 +161,8 @@ def test_register_wires_hook_and_toolset():
 
     assert calls["hooks"] == ["pre_gateway_dispatch"]
     tool_names = [kw["name"] for kw in calls["tools"]]
-    assert tool_names == ["woodhouse_dispatch", "woodhouse_task_status", "woodhouse_kanban_list"]
+    assert tool_names == ["woodhouse_dispatch", "woodhouse_task_status",
+                          "woodhouse_kanban_list", "woodhouse_fetch_codes"]
     for kw in calls["tools"]:
         assert kw["toolset"] == "woodhouse"
         assert callable(kw["handler"])

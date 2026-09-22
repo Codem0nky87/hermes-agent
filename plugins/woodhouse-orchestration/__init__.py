@@ -31,6 +31,7 @@ import re
 import socket
 from collections import namedtuple
 
+from agent import email_read
 from tools.registry import tool_error, tool_result
 
 TagParse = namedtuple("TagParse", "project workstream agent_override body")
@@ -166,6 +167,22 @@ def woodhouse_kanban_list(board):
         return {"ok": False, "error": f"broker unreachable: {exc}"}
 
 
+def woodhouse_fetch_codes(provider, since_minutes=10):
+    """Fetch recent verification codes/links for ``provider`` (Wave-4 Task 6).
+
+    Unlike the three broker tools above, this does not use the broker socket:
+    it calls the bounded, allowlisted email-read tool (``agent.email_read``)
+    directly, which reads only very recent, sender/subject-matched mail and
+    returns at most 3 codes/links — never subjects or bodies, and never logging
+    the values (§16.4 OTP relay, Review Focus #1). Any failure is translated
+    into ``{"ok": False, ...}`` rather than raising into the model.
+    """
+    try:
+        return email_read.fetch_codes(provider, since_minutes=since_minutes)
+    except Exception as exc:  # keep parity with the broker tools: never raise
+        return {"ok": False, "codes": [], "error": f"email tool error: {exc}"}
+
+
 # ── Tool registration ───────────────────────────────────────────────────
 #
 # Registered tool handlers must match the registry's calling convention
@@ -220,6 +237,25 @@ WOODHOUSE_KANBAN_LIST_SCHEMA = {
 }
 
 
+WOODHOUSE_FETCH_CODES_SCHEMA = {
+    "name": "woodhouse_fetch_codes",
+    "description": (
+        "Fetch recent verification codes / sign-in links for an auth provider "
+        "(claude, codex, agy) from its allowlisted sender, for relaying an "
+        "interactive login. Reads only mail newer than since_minutes; returns "
+        "at most 3 items and never returns email subjects or bodies."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "provider": {"type": "string", "description": "Provider slug (claude, codex, agy)."},
+            "since_minutes": {"type": "integer", "description": "Only read mail newer than this many minutes (default 10)."},
+        },
+        "required": ["provider"],
+    },
+}
+
+
 def _handle_woodhouse_dispatch(args: dict, **_kw) -> str:
     project = str(args.get("project") or "").strip()
     objective = str(args.get("objective") or "").strip()
@@ -248,10 +284,23 @@ def _handle_woodhouse_kanban_list(args: dict, **_kw) -> str:
     return tool_result(woodhouse_kanban_list(board))
 
 
+def _handle_woodhouse_fetch_codes(args: dict, **_kw) -> str:
+    provider = str(args.get("provider") or "").strip()
+    if not provider:
+        return tool_error("provider is required")
+    since_minutes = args.get("since_minutes", 10)
+    try:
+        since_minutes = int(since_minutes)
+    except (TypeError, ValueError):
+        since_minutes = 10
+    return tool_result(woodhouse_fetch_codes(provider, since_minutes=since_minutes))
+
+
 _TOOLS = (
     ("woodhouse_dispatch", WOODHOUSE_DISPATCH_SCHEMA, _handle_woodhouse_dispatch, "🛰️"),
     ("woodhouse_task_status", WOODHOUSE_TASK_STATUS_SCHEMA, _handle_woodhouse_task_status, "📋"),
     ("woodhouse_kanban_list", WOODHOUSE_KANBAN_LIST_SCHEMA, _handle_woodhouse_kanban_list, "🗂️"),
+    ("woodhouse_fetch_codes", WOODHOUSE_FETCH_CODES_SCHEMA, _handle_woodhouse_fetch_codes, "🔑"),
 )
 
 

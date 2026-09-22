@@ -1,6 +1,6 @@
 name: woodhouse-orchestration
 version: "0.1.0"
-description: "Strict-tag intake for Woodhouse multi-agent orchestration: parses [project][workstream] @agent tags on inbound gateway messages and normalizes them for deliberate broker dispatch. Provides the woodhouse toolset (woodhouse_dispatch, woodhouse_task_status, woodhouse_kanban_list) which talks to the Woodhouse broker over a local unix socket (~/.woodhouse/broker.sock) — no shell, no file writes."
+description: "Strict-tag intake for Woodhouse multi-agent orchestration: parses [project][workstream] @agent tags on inbound gateway messages and normalizes them for deliberate broker dispatch. Provides the woodhouse toolset (woodhouse_dispatch, woodhouse_task_status, woodhouse_kanban_list) which talks to the Woodhouse broker over a local unix socket (~/.woodhouse/broker.sock), plus woodhouse_fetch_codes, a bounded allowlisted email-read tool for the §16.4 OTP relay that returns at most 3 recent verification codes/links and never subjects or bodies."
 author: Woodhouse
 hooks:
   - pre_gateway_dispatch
@@ -8,3 +8,4 @@ provides_tools:
   - woodhouse_dispatch
   - woodhouse_task_status
   - woodhouse_kanban_list
+  - woodhouse_fetch_codes
