@@ -561,3 +561,27 @@ def test_owner_key_is_kept_when_only_the_fallback_can_reach_it(monkeypatch):
     key = run_mod.GatewayRunner._woodhouse_owner_session_key
     assert key(runner, {"woodhouse": {"owner_session_key": WA_OWNER}}) == \
         WA_OWNER
+
+
+def test_owner_chat_match_is_positional_not_tail(monkeypatch):
+    """Carried finding (delivery-hotfix review, Important): the home-channel
+    match must be POSITIONAL against the chat-id slot, never the whole tail.
+
+    A WhatsApp group the owner belongs to keys as
+    ``agent:main:whatsapp:group:{group_id}:{owner_participant_id}`` when
+    ``group_sessions_per_user`` is on — the owner's own (canonical) id lands
+    in the tail. The old ``home_chat_id in parts[4:]`` matched it, so the
+    group's question was rerouted into the owner's private channel and marked
+    delivered. Only the chat-id slot (parts[4] here) may match."""
+    from gateway import run as run_mod
+    runner = _fallback_runner(
+        run_mod, monkeypatch, _FakeAdapter(), owner="",
+        home_chat_id="27825323250@s.whatsapp.net")  # canonicalizes to 27825323250
+
+    # Group session the owner participates in: the owner's canonical id is the
+    # trailing participant slot (parts[5]); the group's own chat id is parts[4].
+    group_key = "agent:main:whatsapp:group:120363001234567890@g.us:27825323250"
+    assert runner._question_home_channel_fallback(group_key) is None
+
+    # The true owner DM (chat id == the home channel) must still match.
+    assert runner._question_home_channel_fallback(WA_OWNER) is not None

@@ -15744,9 +15744,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         home_chat_id = str(home.chat_id)
         if platform == Platform.WHATSAPP:
             home_chat_id = _canonical_whatsapp_identifier(home_chat_id)
-        # parts[4:] rather than parts[4] so a Slack key (whose scope id sits
-        # ahead of the chat id) and a threaded DM both still match.
-        if home_chat_id and home_chat_id in parts[4:]:
+        # Positional chat-id match. ``build_session_key`` emits
+        #   agent:main:{platform}:{chat_type}[:{slack_scope}]:{chat_id}[:{thread}][:{participant}]
+        # so the chat id is parts[4] — or parts[5] on Slack, whose workspace
+        # scope id precedes the chat id. Match ONLY the chat-id slot(s).
+        # The old ``home_chat_id in parts[4:]`` matched ANY tail position, so a
+        # trailing participant id false-matched: for a WhatsApp group the owner
+        # belongs to (group_sessions_per_user=True appends the owner's own
+        # canonical id after the group chat id), the group session matched "the
+        # owner's own chat" and rerouted the group's question into the private
+        # channel while marking it delivered.
+        chat_id_slots = []
+        if len(parts) > 4:
+            chat_id_slots.append(parts[4])
+        if platform == Platform.SLACK and len(parts) > 5:
+            chat_id_slots.append(parts[5])
+        if home_chat_id and home_chat_id in chat_id_slots:
             return platform, home
         try:
             owner = cfg_get(_load_gateway_runtime_config(), "woodhouse",
