@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "node bridge.js",
-    "check": "node --check allowlist.js && node --check baileys_logger.js && node --check bridge.js && node --check bridge_helpers.js && node --check connection_close.js && node --check outbound_ids.js && node --check owner_message_gate.js && node --test"
+    "check": "node --check allowlist.js && node --check baileys_logger.js && node --check attach.js && node --check bridge.js && node --check bridge_helpers.js && node --check connection_close.js && node --check outbound_ids.js && node --check owner_message_gate.js && node --test"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "7.0.0-rc13",
