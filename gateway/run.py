@@ -15694,6 +15694,126 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         senders[session_key] = _send
 
+    def _question_home_channel_fallback(self, session_key: str):
+        """Home channel a question for *session_key* may be sent to directly.
+
+        Returns ``(platform, home)`` or ``None``.
+
+        Ask-time senders only exist for a session that asked a question
+        from inside an agent turn. A broker decision comes from the poller
+        — there is no turn, so the owner's session never has one — and
+        without this fallback every broker question is registered, dropped,
+        retired, re-offered by the broker and dropped again, forever. The
+        owner never sees a circuit or a critical decision, which is the
+        whole point of the relay.
+
+        Only the owner's own chat is eligible, and eligibility is proven
+        one of two ways:
+
+        - the home channel IS this session's chat — its id (canonicalized
+          the way ``build_session_key`` canonicalizes a WhatsApp chat id)
+          appears in the key. This is the ordinary post-restart case, where
+          the in-memory sender map was lost but the chat is unchanged.
+        - the operator named this key as ``woodhouse.owner_session_key``.
+          A WhatsApp home channel is often recorded as a LID while the
+          session key carries the phone number, and the two are only
+          linkable from the bridge's own session directory — which a
+          profile pointed at a shared bridge cannot read.
+
+        Anything else keeps the old drop-and-retire behavior: surfacing one
+        chat's question in another chat would be worse than losing it.
+        """
+        parts = (session_key or "").split(":")
+        if len(parts) < 5 or parts[0] != "agent":
+            return None
+        try:
+            platform = Platform(parts[2])
+        except ValueError:
+            return None
+        config = getattr(self, "config", None)
+        if config is None:
+            return None
+        try:
+            home = config.get_home_channel(platform)
+        except Exception:
+            logger.debug("Question fallback: home channel lookup failed",
+                         exc_info=True)
+            return None
+        if home is None or not getattr(home, "chat_id", ""):
+            return None
+        home_chat_id = str(home.chat_id)
+        if platform == Platform.WHATSAPP:
+            home_chat_id = _canonical_whatsapp_identifier(home_chat_id)
+        # parts[4:] rather than parts[4] so a Slack key (whose scope id sits
+        # ahead of the chat id) and a threaded DM both still match.
+        if home_chat_id and home_chat_id in parts[4:]:
+            return platform, home
+        try:
+            owner = cfg_get(_load_gateway_runtime_config(), "woodhouse",
+                            "owner_session_key", default="")
+        except Exception:
+            logger.debug("Question fallback: owner key lookup failed",
+                         exc_info=True)
+            return None
+        if isinstance(owner, str) and owner and owner == session_key:
+            return platform, home
+        return None
+
+    async def _send_question_text_via_home_channel(
+        self, session_key: str, text: str,
+    ) -> bool:
+        """Send question *text* straight to the owner's home channel.
+
+        The same in-process delivery ``hermes send -t <platform>`` performs:
+        resolve the logical platform to its live transport, then send to the
+        recorded home chat. Returns False on every failure so the caller's
+        register-then-retire fail-safe still runs — a question that cannot
+        be delivered must never hold the one-question wire.
+        """
+        target = self._question_home_channel_fallback(session_key)
+        if target is None:
+            return False
+        platform, home = target
+        chat_id = str(home.chat_id)
+        try:
+            transport = resolve_delivery_transport(
+                platform, self.config, getattr(self, "adapters", None),
+            )
+            if transport is None:
+                logger.error(
+                    "Question fallback for %s: platform %s is not deliverable "
+                    "in this gateway", session_key, platform.value,
+                )
+                return False
+            adapter = transport.adapter
+            metadata = self._thread_metadata_for_target(
+                platform, chat_id, getattr(home, "thread_id", None),
+                chat_type="dm", adapter=adapter,
+            )
+            result = await (
+                adapter.send(chat_id, text, metadata=metadata) if metadata
+                else adapter.send(chat_id, text)
+            )
+        except Exception:
+            logger.error(
+                "Question fallback send to the %s home channel failed for %s",
+                platform.value, session_key, exc_info=True,
+            )
+            return False
+        if result is not None and getattr(result, "success", True) is False:
+            logger.error(
+                "Question fallback send to the %s home channel was rejected "
+                "for %s: %s", platform.value, session_key,
+                getattr(result, "error", None),
+            )
+            return False
+        logger.info(
+            "Question for %s delivered over the %s home channel (%s): no "
+            "ask-time sender is registered for that session",
+            session_key, platform.value, chat_id,
+        )
+        return True
+
     async def _send_question_text(self, session_key: str, text: str) -> bool:
         """Deliver question text to the session that owns the question.
 
@@ -15701,15 +15821,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         registered a question before sending it need that signal: a question
         nobody can see must be retired, not left holding the one-question
         wire for its whole TTL.
+
+        A missing ask-time sender is not the end of the road: when the
+        session is the owner's own chat the question goes out over the
+        platform's home channel instead (see
+        ``_question_home_channel_fallback``). Wiring that here rather than
+        in the poller means every broker question benefits, not only the
+        first of a batch.
         """
         sender = (getattr(self, "_question_senders", None) or {}).get(session_key)
         if sender is None:
+            if await self._send_question_text_via_home_channel(
+                session_key, text,
+            ):
+                return True
             # Nothing to do but say so loudly: a promoted or re-asked
             # question that cannot be delivered is a question the user will
             # never see, while its task keeps waiting.
             logger.error(
-                "No question sender registered for session %s; dropping "
-                "question text", session_key,
+                "No question sender registered for session %s and no home "
+                "channel to fall back to; dropping question text", session_key,
             )
             return False
         await sender(text)
@@ -15879,12 +16010,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         configured = cfg_get(cfg, "woodhouse", "owner_session_key", default="")
         senders = getattr(self, "_question_senders", None) or {}
         if isinstance(configured, str) and configured:
-            if senders and configured not in senders:
+            if (
+                senders
+                and configured not in senders
+                and self._question_home_channel_fallback(configured) is None
+            ):
                 # A typo'd key cannot be delivered to. Say so rather than
-                # register questions the owner will never see.
+                # register questions the owner will never see. A key with a
+                # home channel behind it IS deliverable, though — the
+                # relay must not go dark just because some other chat
+                # happened to register a sender first.
                 logger.error(
                     "woodhouse.owner_session_key %r has no registered "
-                    "question sender (known: %s)", configured, sorted(senders),
+                    "question sender and no home channel (known: %s)",
+                    configured, sorted(senders),
                 )
                 return ""
             return configured

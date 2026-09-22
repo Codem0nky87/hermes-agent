@@ -309,7 +309,12 @@ async def test_send_question_text_reports_missing_sender():
     from gateway import run as run_mod
 
     class _Runner:
+        # No ``config`` at all ⇒ no home channel to fall back to either.
         _question_senders = {}
+        _question_home_channel_fallback = \
+            run_mod.GatewayRunner._question_home_channel_fallback
+        _send_question_text_via_home_channel = \
+            run_mod.GatewayRunner._send_question_text_via_home_channel
 
     assert await run_mod.GatewayRunner._send_question_text(
         _Runner(), "nobody", "text") is False
@@ -379,11 +384,17 @@ async def test_unconfigured_owner_key_refuses_every_reply(tmp_path,
 
 
 def test_owner_key_must_have_a_registered_sender():
-    """I5: a configured key nobody can be reached at is no key at all."""
+    """I5: a configured key nobody can be reached at is no key at all.
+
+    No ``config`` on the stub ⇒ no home channel either, so the only way to
+    reach a key here is a registered ask-time sender.
+    """
     from gateway import run as run_mod
 
     class _Runner:
         _question_senders = {"wa:real": lambda t: None}
+        _question_home_channel_fallback = \
+            run_mod.GatewayRunner._question_home_channel_fallback
 
     runner = _Runner()
     key = run_mod.GatewayRunner._woodhouse_owner_session_key
@@ -395,3 +406,158 @@ def test_owner_key_must_have_a_registered_sender():
     runner._question_senders = {}
     assert key(runner, {"woodhouse": {"owner_session_key": "wa:real"}}) == \
         "wa:real"
+
+
+# --- Fix round 2: direct home-channel fallback for broker delivery -----
+#
+# A broker decision comes from the poller, not from an agent turn, so
+# nothing ever registers an ask-time question sender for the owner's
+# session. Without a fallback every broker question is registered,
+# dropped, retired, re-offered and dropped again — forever.
+
+WA_OWNER = "agent:main:whatsapp:dm:27825323250"
+WA_HOME = "36490075709622@lid"
+
+
+class _FakeAdapter:
+    """Minimal platform adapter: records sends, or refuses them."""
+
+    def __init__(self, working=True):
+        self.sent = []
+        self.working = working
+
+    async def send(self, chat_id, text, metadata=None):
+        if not self.working:
+            raise RuntimeError("whatsapp bridge is down")
+        self.sent.append((chat_id, text, metadata))
+        return None
+
+
+def _fallback_runner(run_mod, monkeypatch, adapter, *, owner=WA_OWNER,
+                     home_chat_id=WA_HOME):
+    """A runner stub with a home channel but no ask-time senders."""
+    from gateway.config import HomeChannel, Platform
+
+    home = HomeChannel(platform=Platform.WHATSAPP, chat_id=home_chat_id,
+                       name="Home")
+
+    class _Config:
+        platforms = {}
+
+        @staticmethod
+        def get_home_channel(platform):
+            return home if platform == Platform.WHATSAPP else None
+
+    class _Runner:
+        config = _Config()
+        adapters = {Platform.WHATSAPP: adapter}
+        _question_senders = {}
+        _thread_metadata_for_target = \
+            run_mod.GatewayRunner._thread_metadata_for_target
+        _is_telegram_dm_topic_target = \
+            run_mod.GatewayRunner._is_telegram_dm_topic_target
+        _question_home_channel_fallback = \
+            run_mod.GatewayRunner._question_home_channel_fallback
+        _send_question_text_via_home_channel = \
+            run_mod.GatewayRunner._send_question_text_via_home_channel
+        _send_question_text = run_mod.GatewayRunner._send_question_text
+
+    monkeypatch.setattr(
+        run_mod, "_load_gateway_runtime_config",
+        lambda: {"woodhouse": {"owner_session_key": owner}})
+    return _Runner()
+
+
+@pytest.mark.asyncio
+async def test_broker_question_delivered_without_an_asktime_sender(
+        tmp_path, monkeypatch):
+    """The live defect: no sender for the owner session must NOT mean the
+    owner never sees the question."""
+    from gateway import run as run_mod
+    reg = QuestionRegistry(str(tmp_path / "q.db"))
+    adapter = _FakeAdapter()
+    runner = _fallback_runner(run_mod, monkeypatch, adapter)
+
+    async def send(sk, text):
+        return await runner._send_question_text(sk, text)
+
+    owned = await run_mod._submit_broker_decisions(reg, send, WA_OWNER, [
+        {"decision_id": "e31382f8", "question": "codex blocked: apply?",
+         "critical_class": "auth_expiry"}])
+
+    assert len(adapter.sent) == 1
+    chat_id, text, _meta = adapter.sent[0]
+    assert chat_id == WA_HOME
+    assert "codex blocked: apply?" in text and "[CRITICAL]" in text
+    assert owned == ["e31382f8"]            # broker gets its decision.ack
+    assert reg.pending() is not None        # the question is live, not retired
+
+
+@pytest.mark.asyncio
+async def test_fallback_delivery_logs_that_it_was_used(tmp_path, monkeypatch,
+                                                       caplog):
+    from gateway import run as run_mod
+    adapter = _FakeAdapter()
+    runner = _fallback_runner(run_mod, monkeypatch, adapter)
+    with caplog.at_level("INFO", logger="gateway.run"):
+        assert await runner._send_question_text(WA_OWNER, "[D-AAA] q?") is True
+    assert any("home channel" in r.getMessage()
+               for r in caplog.records if r.levelname == "INFO")
+
+
+@pytest.mark.asyncio
+async def test_fallback_failure_still_retires_the_question(tmp_path,
+                                                           monkeypatch):
+    """I5 still holds: if the direct send also fails, nothing jams the wire
+    and the broker is never acknowledged."""
+    from gateway import run as run_mod
+    reg = QuestionRegistry(str(tmp_path / "q.db"))
+    adapter = _FakeAdapter(working=False)
+    runner = _fallback_runner(run_mod, monkeypatch, adapter)
+
+    async def send(sk, text):
+        return await runner._send_question_text(sk, text)
+
+    owned = await run_mod._submit_broker_decisions(reg, send, WA_OWNER, [
+        {"decision_id": "d1", "question": "nobody can see this",
+         "critical_class": None}])
+
+    assert owned == []
+    assert reg.pending() is None and reg.held_ids() == []
+
+
+@pytest.mark.asyncio
+async def test_fallback_never_leaks_another_chats_question(monkeypatch):
+    """Only the owner's own chat is eligible — a question asked in some
+    other session must not surface in the owner's home channel."""
+    from gateway import run as run_mod
+    adapter = _FakeAdapter()
+    runner = _fallback_runner(run_mod, monkeypatch, adapter)
+    assert await runner._send_question_text(
+        "agent:main:whatsapp:dm:27999999999", "[D-BBB] private") is False
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_fallback_matches_a_home_channel_that_owns_the_session(
+        monkeypatch):
+    """No woodhouse config needed when the home channel IS the session's
+    own chat — the ordinary post-restart case."""
+    from gateway import run as run_mod
+    adapter = _FakeAdapter()
+    runner = _fallback_runner(run_mod, monkeypatch, adapter, owner="",
+                              home_chat_id="27825323250@s.whatsapp.net")
+    assert await runner._send_question_text(WA_OWNER, "[D-CCC] q?") is True
+    assert adapter.sent[0][0] == "27825323250@s.whatsapp.net"
+
+
+def test_owner_key_is_kept_when_only_the_fallback_can_reach_it(monkeypatch):
+    """A configured owner key with no ask-time sender is still deliverable
+    once the home-channel fallback exists — the relay must not go dark just
+    because some other chat asked a question first."""
+    from gateway import run as run_mod
+    runner = _fallback_runner(run_mod, monkeypatch, _FakeAdapter())
+    runner._question_senders = {"some-other-chat": lambda t: None}
+    key = run_mod.GatewayRunner._woodhouse_owner_session_key
+    assert key(runner, {"woodhouse": {"owner_session_key": WA_OWNER}}) == \
+        WA_OWNER
