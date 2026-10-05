@@ -31,8 +31,14 @@ import re
 import socket
 from collections import namedtuple
 
-from agent import email_read
 from tools.registry import tool_error, tool_result
+
+# email_read is imported LAZILY inside woodhouse_fetch_codes, not at module
+# scope: vendored Hermes v0.21.4 renamed/removed agent.email_read, and a
+# module-level import failure here would take down the ENTIRE plugin — including
+# woodhouse_dispatch, the gateway's only path to dispatch work to code agents.
+# The dispatch/status/cancel tools do not need email_read; only the Wave-4 OTP
+# relay does, and it degrades to an {"ok": False} error if the module is absent.
 
 TagParse = namedtuple("TagParse", "project workstream agent_override body")
 
@@ -178,6 +184,7 @@ def woodhouse_fetch_codes(provider, since_minutes=10):
     into ``{"ok": False, ...}`` rather than raising into the model.
     """
     try:
+        from agent import email_read  # lazy: absent on some Hermes builds
         return email_read.fetch_codes(provider, since_minutes=since_minutes)
     except Exception as exc:  # keep parity with the broker tools: never raise
         return {"ok": False, "codes": [], "error": f"email tool error: {exc}"}
